@@ -530,6 +530,111 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "delete_bet", "id": bet_id})
 
 
+# ── /edit — Modifier un pari pending ─────────────────────────
+# Format: /edit <id> mise <valeur> | /edit <id> cote <valeur> | /edit <id> desc <texte>
+
+EDIT_PATTERN = re.compile(
+    r"(\d+)\s+(mise|cote|desc(?:ription)?)\s+(.+)",
+    re.IGNORECASE
+)
+
+async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/edit <id> <champ> <valeur> — modifier un pari pending."""
+    if not ctx.args:
+        await update.message.reply_text(
+            "Format : /edit <id> <champ> <valeur>\n"
+            "Champs : mise, cote, desc\n"
+            "Ex: /edit 3 mise 1000\n"
+            "Ex: /edit 3 cote 2.50\n"
+            "Ex: /edit 3 desc PSG ML"
+        )
+        return
+
+    raw = " ".join(ctx.args)
+    m = EDIT_PATTERN.search(raw)
+    if not m:
+        await update.message.reply_text(
+            "Format pas reconnu.\n"
+            "Ex: /edit 3 mise 1000"
+        )
+        return
+
+    bet_id = int(m.group(1))
+    field = m.group(2).lower()
+    value = m.group(3).strip()
+
+    con = db()
+    bet = con.execute(
+        "SELECT * FROM bets WHERE id = ? AND chat_id = ? AND status = 'pending'",
+        (bet_id, update.message.chat_id)
+    ).fetchone()
+
+    if not bet:
+        con.close()
+        await update.message.reply_text(f"Pari #{bet_id} introuvable ou deja resolu.")
+        return
+
+    if field == "mise":
+        try:
+            new_val = float(value.replace(",", "."))
+        except ValueError:
+            con.close()
+            await update.message.reply_text("Mise invalide.")
+            return
+        if new_val <= 0:
+            con.close()
+            await update.message.reply_text("Mise invalide.")
+            return
+        con.execute("UPDATE bets SET stake = ? WHERE id = ?", (new_val, bet_id))
+        display = f"Mise → {new_val:.0f} CHF"
+    elif field == "cote":
+        try:
+            new_val = float(value.replace(",", "."))
+        except ValueError:
+            con.close()
+            await update.message.reply_text("Cote invalide.")
+            return
+        if new_val < 1.01:
+            con.close()
+            await update.message.reply_text("Cote invalide.")
+            return
+        con.execute("UPDATE bets SET odds = ? WHERE id = ?", (new_val, bet_id))
+        display = f"Cote → {new_val:.2f}"
+    else:  # desc / description
+        con.execute("UPDATE bets SET description = ? WHERE id = ?", (value, bet_id))
+        display = f"Description → {value}"
+
+    con.commit()
+
+    # Reload updated bet for display
+    bet = con.execute("SELECT * FROM bets WHERE id = ?", (bet_id,)).fetchone()
+    con.close()
+
+    pp = bet["stake"] / NB_PARTS
+    gain_pp = bet["stake"] * (bet["odds"] - 1) / NB_PARTS
+
+    text = (
+        f"Pari #{bet_id} modifie\n"
+        f"  {display}\n\n"
+        f"  {bet['description']} @  {bet['odds']:.2f}\n"
+        f"  Mise : {bet['stake']:.0f} CHF ({pp:.0f}/pers.)\n"
+        f"  Gain potentiel : {fmt(gain_pp)}/pers."
+    )
+    await update.message.reply_text(text)
+
+    # Sync to Google Sheets — delete old row + insert updated
+    await sync_sheets({"action": "delete_bet", "id": bet_id})
+    await sync_sheets({
+        "action": "new_bet",
+        "id": bet_id,
+        "date": bet["created_at"][:10] if bet["created_at"] else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "description": bet["description"],
+        "stake": bet["stake"],
+        "odds": bet["odds"],
+        "user_name": bet["user_name"]
+    })
+
+
 # ââ /help âââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -541,6 +646,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /win  (repondre au pari ou /win <id>)\n"
         "  /loss (repondre au pari ou /loss <id>)\n"
         "  /void (annule/rembourse)\n\n"
+        "Modifier :\n"
+        "  /edit <id> mise 1000\n"
+        "  /edit <id> cote 2.50\n"
+        "  /edit <id> desc PSG ML\n\n"
         "Stats :\n"
         "  /solde â P&L du groupe\n"
         "  /dettes â qui doit quoi a qui\n"
@@ -646,6 +755,7 @@ def main():
     app.add_handler(CommandHandler("dettes", cmd_dettes))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
 
