@@ -4,14 +4,15 @@ Enregistre les paris du groupe, divise par 3, track P&L et dettes.
 
 Usage principal :
   /lock 800 Strasbourg 1N2 3,10
-  → Enregistre un pari de 800 CHF sur Strasbourg 1N2 à cote 3.10
+  â Enregistre un pari de 800 CHF sur Strasbourg 1N2 Ã  cote 3.10
 
-Résultat : répondre au message de confirmation avec /win ou /loss
+RÃ©sultat : rÃ©pondre au message de confirmation avec /win ou /loss
 """
 import os
 import re
 import sqlite3
 import logging
+import aiohttp
 from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import (
@@ -19,15 +20,16 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ── Config ──────────────────────────────────────────────────
+# ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââ
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
 NB_PARTS = 3
 DB_PATH = "bets.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Database ────────────────────────────────────────────────
+# ââ Database ââââââââââââââââââââââââââââââââââââââââââââââââ
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -53,12 +55,24 @@ def db():
     con.row_factory = sqlite3.Row
     return con
 
-# ── Helpers ─────────────────────────────────────────────────
+# ââ Helpers âââââââââââââââââââââââââââââââââââââââââââââââââ
 def fmt(amount: float) -> str:
     return f"+{amount:.0f} CHF" if amount >= 0 else f"{amount:.0f} CHF"
 
 def fmt_abs(amount: float) -> str:
     return f"{abs(amount):.0f} CHF"
+
+async def sync_sheets(payload: dict):
+    """POST data to Google Sheets webhook (fire-and-forget)."""
+    if not SHEETS_WEBHOOK_URL:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                log.info(f"Sheets sync: {payload.get('action')} â {resp.status}")
+    except Exception as e:
+        log.warning(f"Sheets sync failed: {e}")
+
 
 def get_total_pnl(con, chat_id: int) -> float:
     rows = con.execute(
@@ -73,27 +87,27 @@ def get_total_pnl(con, chat_id: int) -> float:
             total -= r["stake"] / NB_PARTS
     return total
 
-# ── /lock — Enregistrer un pari ─────────────────────────────
+# ââ /lock â Enregistrer un pari âââââââââââââââââââââââââââââ
 # Format: /lock <mise> <description> <cote>
 # Exemples:
 #   /lock 800 Strasbourg 1N2 3,10
 #   /lock 500 chf Le Mans ML @ 1.70
 #   /lock 200 Arsenal O2.5 buts 1,85
 #
-# Règle : le premier nombre = mise, le dernier nombre = cote,
+# RÃ¨gle : le premier nombre = mise, le dernier nombre = cote,
 #         tout entre les deux = description
 
 LOCK_PATTERN = re.compile(
     r"(\d+(?:[.,]\d+)?)"      # groupe 1 : mise (premier nombre)
-    r"\s*(?:chf)?\s+"          # optionnel "CHF" après la mise
+    r"\s*(?:chf)?\s+"          # optionnel "CHF" aprÃ¨s la mise
     r"(.+?)\s+"                # groupe 2 : description (tout au milieu)
     r"(?:@\s*)?"               # optionnel "@" avant la cote
-    r"(\d+[.,]\d+)",           # groupe 3 : cote (dernier nombre avec décimale)
+    r"(\d+[.,]\d+)",           # groupe 3 : cote (dernier nombre avec dÃ©cimale)
     re.IGNORECASE
 )
 
 async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/lock — register a new bet."""
+    """/lock â register a new bet."""
     if not ctx.args:
         await update.message.reply_text(
             "Format : /lock <mise> <description> <cote>\n"
@@ -143,14 +157,25 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"   {desc} @ {odds:.2f}\n"
         f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
         f"   Gain potentiel : {fmt(gain_pp)}/pers.\n\n"
-        f"Resultat → repondre a ce message avec /win ou /loss"
+        f"Resultat â repondre a ce message avec /win ou /loss"
     )
     await update.message.reply_text(text)
 
+    # Sync to Google Sheets
+    await sync_sheets({
+        "action": "new_bet",
+        "id": bet_id,
+        "date": now[:10],
+        "description": desc,
+        "stake": stake,
+        "odds": odds,
+        "user_name": user.first_name
+    })
 
-# ── /win /loss /void — Résultat d'un pari ───────────────────
+
+# ââ /win /loss /void â RÃ©sultat d'un pari âââââââââââââââââââ
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/win or /loss or /void — mark bet result by replying to it."""
+    """/win or /loss or /void â mark bet result by replying to it."""
     msg = update.message
     command = msg.text.strip().split()[0].lower().lstrip("/")
 
@@ -162,7 +187,7 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not status:
         return
 
-    # Find the bet — either by reply or by ID argument
+    # Find the bet â either by reply or by ID argument
     con = db()
     bet = None
 
@@ -204,9 +229,9 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bet = pending[0]
         elif len(pending) > 1:
             con.close()
-            lines = ["Plusieurs paris en attente — precise lequel :\n"]
+            lines = ["Plusieurs paris en attente â precise lequel :\n"]
             for p in pending:
-                lines.append(f"  /win {p['id']}  →  {p['description']} @ {p['odds']:.2f}")
+                lines.append(f"  /win {p['id']}  â  {p['description']} @ {p['odds']:.2f}")
             await msg.reply_text("\n".join(lines))
             return
 
@@ -241,8 +266,11 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_text(text)
 
+    # Sync to Google Sheets
+    await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status})
 
-# ── /solde ──────────────────────────────────────────────────
+
+# ââ /solde ââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -286,7 +314,7 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ── /historique ─────────────────────────────────────────────
+# ââ /historique âââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con = db()
     rows = con.execute(
@@ -299,7 +327,7 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Aucun pari enregistre.")
         return
 
-    icons = {"pending": "⏳", "won": "✅", "lost": "❌", "void": "↩️"}
+    icons = {"pending": "â³", "won": "â", "lost": "â", "void": "â©ï¸"}
     lines = ["HISTORIQUE (15 derniers)\n"]
     for r in rows:
         icon = icons.get(r["status"], "?")
@@ -319,7 +347,7 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /stats ──────────────────────────────────────────────────
+# ââ /stats ââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con = db()
     rows = con.execute(
@@ -382,7 +410,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ── /dettes ─────────────────────────────────────────────────
+# ââ /dettes âââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -441,7 +469,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c = list(creditors)
         while di < len(d) and ci < len(c):
             transfer = min(d[di][1], c[ci][1])
-            lines.append(f"  {names[d[di][0]]} → {names[c[ci][0]]} : {transfer:.0f} CHF")
+            lines.append(f"  {names[d[di][0]]} â {names[c[ci][0]]} : {transfer:.0f} CHF")
             d[di] = (d[di][0], d[di][1] - transfer)
             c[ci] = (c[ci][0], c[ci][1] - transfer)
             if d[di][1] < 0.5: di += 1
@@ -450,7 +478,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /pending ────────────────────────────────────────────────
+# ââ /pending ââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con = db()
     rows = con.execute(
@@ -469,11 +497,11 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"#{r['id']} | {r['description']} @ {r['odds']:.2f} | "
             f"{r['stake']:.0f} CHF ({r['stake']/NB_PARTS:.0f}/pers.)"
         )
-    lines.append(f"\n→ /win <id> ou /loss <id> pour marquer le resultat")
+    lines.append(f"\nâ /win <id> ou /loss <id> pour marquer le resultat")
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /delete ─────────────────────────────────────────────────
+# ââ /delete âââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage : /delete <id>")
@@ -498,8 +526,11 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.close()
     await update.message.reply_text(f"Pari #{bet_id} supprime ({bet['description']}).")
 
+    # Sync to Google Sheets
+    await sync_sheets({"action": "delete_bet", "id": bet_id})
 
-# ── /help ───────────────────────────────────────────────────
+
+# ââ /help âââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "BET TRACKER\n\n"
@@ -511,27 +542,27 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  /loss (repondre au pari ou /loss <id>)\n"
         "  /void (annule/rembourse)\n\n"
         "Stats :\n"
-        "  /solde — P&L du groupe\n"
-        "  /dettes — qui doit quoi a qui\n"
-        "  /pending — paris en attente\n"
-        "  /historique — 15 derniers paris\n"
-        "  /stats — stats detaillees\n"
-        "  /delete <id> — supprimer un pari"
+        "  /solde â P&L du groupe\n"
+        "  /dettes â qui doit quoi a qui\n"
+        "  /pending â paris en attente\n"
+        "  /historique â 15 derniers paris\n"
+        "  /stats â stats detaillees\n"
+        "  /delete <id> â supprimer un pari"
     )
     await update.message.reply_text(text)
 
 
-# ── Fallback : reply gagné/perdu ────────────────────────────
+# ââ Fallback : reply gagnÃ©/perdu ââââââââââââââââââââââââââââ
 async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Allow marking results by replying 'gagné' or 'perdu' to the bot message."""
+    """Allow marking results by replying 'gagnÃ©' or 'perdu' to the bot message."""
     msg = update.message
     if not msg or not msg.reply_to_message or not msg.text:
         return
 
     text_lower = msg.text.strip().lower()
-    won_words = {"gagné", "gagne", "win", "won", "w", "gg"}
+    won_words = {"gagnÃ©", "gagne", "win", "won", "w", "gg"}
     lost_words = {"perdu", "perd", "lose", "lost", "l"}
-    void_words = {"annulé", "annule", "void", "push", "nul"}
+    void_words = {"annulÃ©", "annule", "void", "push", "nul"}
 
     status = None
     if text_lower in won_words:
@@ -588,8 +619,11 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_text(text)
 
+    # Sync to Google Sheets
+    await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status})
 
-# ── Main ────────────────────────────────────────────────────
+
+# ââ Main ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def main():
     if not BOT_TOKEN:
         print("ERROR: Set BOT_TOKEN environment variable")
@@ -598,10 +632,10 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # /lock — register bet
+    # /lock â register bet
     app.add_handler(CommandHandler("lock", cmd_lock))
 
-    # /win /loss /void — mark result
+    # /win /loss /void â mark result
     for cmd in ["win", "w", "gagne", "loss", "lose", "l", "perdu", "void", "push", "annule"]:
         app.add_handler(CommandHandler(cmd, cmd_result))
 
@@ -615,7 +649,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
 
-    # Fallback: reply with "gagné"/"perdu" (no command prefix)
+    # Fallback: reply with "gagnÃ©"/"perdu" (no command prefix)
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
         on_reply_result
