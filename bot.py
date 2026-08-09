@@ -76,7 +76,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
     losses = {}
 
     for b in bets:
-        u = b["user_name"]
+        u = b["user_name"].strip().capitalize()
         users.add(u)
         S, O, st = b["stake"], b["odds"], b["status"]
         if st == "void":
@@ -96,7 +96,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
 
     expense_total = {}
     for e in expenses:
-        u = e["paid_by"]
+        u = e["paid_by"].strip().capitalize()
         users.add(u)
         contribution[u] = contribution.get(u, 0) + e["amount"]
         expense_total[u] = expense_total.get(u, 0) + e["amount"]
@@ -111,8 +111,8 @@ def get_duo_tricount(con, chat_id: int) -> dict:
 
     a, b = users[0], users[1]
 
-    # Contribution balance: who advanced more → the other owes half the difference
-    contrib_bal = (contribution.get(a, 0) - contribution.get(b, 0)) / 2
+    # Contribution balance: direct debt (no splitting for duo mode)
+    contrib_bal = contribution.get(a, 0) - contribution.get(b, 0)
 
     # Direct transfers offset the debt
     net_b_to_a = 0.0
@@ -266,7 +266,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Optional @name override after odds
     remainder = raw[m.end():].strip()
     override = re.match(r'@\s*(\S+)', remainder)
-    bettor_name = override.group(1) if override else user.first_name
+    bettor_name = override.group(1).strip().capitalize() if override else user.first_name
     now = datetime.now(timezone.utc).isoformat()
 
     con = db()
