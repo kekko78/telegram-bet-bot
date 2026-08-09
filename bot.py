@@ -829,9 +829,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
-            "  /delete <id> — supprimer un pari"\n"\n"
-            "  /deletetx <id> — supprimer un remb
-            "  /deletetx <id> — supprimer un remb/depense
+            "  /delete <id> — supprimer un pari\n"
+            "  /deletetx <id> — supprimer un remb/depense"
         )
     else:
         text = (
@@ -851,7 +850,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
-            "  /delete <id> — supprimer un pari"
+            "  /delete <id> — supprimer un pari\n"
+            "  /deletetx <id> — supprimer un remb/depense"
         )
     await update.message.reply_text(text)
 
