@@ -567,7 +567,8 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     duo = is_duo(chat_id)
-    divisor = 1 if duo else NB_PARTS    wins = losses = 0
+    divisor = 1 if duo else NB_PARTS
+    wins = losses = 0
     total_pnl = 0.0
     total_staked = 0.0
     best_win = 0.0
