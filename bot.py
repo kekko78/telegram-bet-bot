@@ -2,7 +2,7 @@
 Telegram Bet Tracker Bot
 Deux modes :
   - Groupe (Bets Suisse) : divise par 3, CHF, bankroll commune
-  - Duo (Alex-Rapha) : Tricount style, EUR, qui doit quoi à qui
+  - Duo (Kekko-Rapha) : Tricount style, EUR, qui doit quoi à qui
 
 Usage principal :
   /lock 800 Strasbourg 1N2 3,10
@@ -26,6 +26,8 @@ SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
 NB_PARTS = 3
 DB_PATH = "bets.db"
 DUO_CHAT_ID = int(os.environ.get("DUO_CHAT_ID", "0"))
+SHEET_ID_GROUP = "1izpo65I_FgrTUaarqiGCJHv7VQ2A-ixMOcnb7PJrU7k"
+SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -164,6 +166,9 @@ def db():
 async def sync_sheets(payload: dict):
     if not SHEETS_WEBHOOK_URL:
         return
+    # Route to correct spreadsheet based on sheet_tab
+    tab = payload.get("sheet_tab", "Paris")
+    payload["sheet_id"] = SHEET_ID_DUO if tab == "Kekko-Rapha" else SHEET_ID_GROUP
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -175,7 +180,7 @@ async def sync_sheets(payload: dict):
 LOCK_PATTERN = re.compile(
     r"(\d+(?:[.,]\d+)?)"      # groupe 1 : mise
     r"\s*(?:chf|eur|€)?\s+"   # optionnel devise
-    r"(.+?)\s+"                # groupe 2 : description
+    r"(.+)\s+"                 # groupe 2 : description (greedy → last number = cote)
     r"(?:@\s*)?"               # optionnel "@"
     r"(\d+[.,]\d+)",           # groupe 3 : cote
     re.IGNORECASE
@@ -248,7 +253,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(text)
 
-    sheet_tab = "Alex-Rapha" if is_duo(chat_id) else "Paris"
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({
         "action": "new_bet",
         "id": bet_id,
@@ -371,7 +376,7 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text(text)
 
-    sheet_tab = "Alex-Rapha" if is_duo(chat_id) else "Paris"
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
@@ -695,7 +700,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.close()
     await update.message.reply_text(f"Pari #{bet_id} supprime ({bet['description']}).")
 
-    sheet_tab = "Alex-Rapha" if is_duo(chat_id) else "Paris"
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({"action": "delete_bet", "id": bet_id, "sheet_tab": sheet_tab})
 
 
@@ -715,7 +720,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /win  (repondre au pari ou /win <id>)\n"
             "  /loss (repondre au pari ou /loss <id>)\n\n"
             "Transactions :\n"
-            "  /remb Rapha 200 a Alex — enregistrer un remboursement\n\n"
+            "  /remb Rapha 200 a Kekko — enregistrer un remboursement\n\n"
             "Stats :\n"
             "  /solde — balance entre vous deux\n"
             "  /dettes — qui doit quoi\n"
@@ -735,7 +740,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /loss (repondre au pari ou /loss <id>)\n"
             "  /void (annule/rembourse)\n\n"
             "Transactions :\n"
-            "  /remb Marco 100 a Alex — enregistrer un remboursement\n\n"
+            "  /remb Marco 100 a Kekko — enregistrer un remboursement\n\n"
             "Stats :\n"
             "  /solde — P&L du groupe\n"
             "  /dettes — qui doit quoi a qui\n"
@@ -762,14 +767,14 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text(
             "Format : /remb <de> <montant> à <vers> [description]\n"
-            "Ex: /remb Rapha 200 à Alex remboursement"
+            "Ex: /remb Rapha 200 à Kekko remboursement"
         )
         return
 
     raw = " ".join(ctx.args)
     m = REMB_PATTERN.search(raw)
     if not m:
-        await update.message.reply_text("Format pas reconnu.\nEx: /remb Rapha 200 à Alex remboursement")
+        await update.message.reply_text("Format pas reconnu.\nEx: /remb Rapha 200 à Kekko remboursement")
         return
 
     from_name = m.group(1).capitalize()
@@ -812,7 +817,7 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += f"\n\nBalance : {debt_text}"
     await update.message.reply_text(text)
 
-    sheet_tab = "Alex-Rapha" if is_duo(chat_id) else "Paris"
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({
         "action": "transaction",
         "id": tx_id,
@@ -915,7 +920,7 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await msg.reply_text(reply)
 
-    sheet_tab = "Alex-Rapha" if is_duo(chat_id) else "Paris"
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
