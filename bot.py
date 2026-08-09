@@ -24,7 +24,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
 NB_PARTS = 3
-DB_PATH = "bets.db"
+DB_PATH = "/data/bets.db"
 DUO_CHAT_ID = int(os.environ.get("DUO_CHAT_ID", "0"))
 SHEET_ID_GROUP = "1izpo65I_FgrTUaarqiGCJHv7VQ2A-ixMOcnb7PJrU7k"
 SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
