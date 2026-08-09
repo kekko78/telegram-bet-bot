@@ -829,7 +829,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
-            "  /delete <id> — supprimer un pari"
+            "  /delete <id> — supprimer un pari"\n"\n"
+            "  /deletetx <id> — supprimer un remb
+            "  /deletetx <id> — supprimer un remb/depense
         )
     else:
         text = (
@@ -929,6 +931,55 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "description": description,
         "sheet_tab": sheet_tab
     })
+
+
+# ── /deletetx — Supprimer une transaction ou depense ────────
+async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if not ctx.args:
+        await update.message.reply_text("Usage : /deletetx <id>\nL'ID est affiche quand tu enregistres un /remb ou /depense.")
+        return
+    try:
+        tx_id = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID invalide.")
+        return
+
+    con = db()
+    # Try transactions first
+    tx = con.execute(
+        "SELECT * FROM transactions WHERE id = ? AND chat_id = ?",
+        (tx_id, chat_id)
+    ).fetchone()
+    if tx:
+        con.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+        con.commit()
+        con.close()
+        await update.message.reply_text(
+            f"Transaction #{tx_id} supprimee\n"
+            f"   {tx['from_name']} -> {tx['to_name']} : {tx['amount']:.0f} {cur(chat_id)}\n"
+            f"   Motif : {tx['description']}"
+        )
+        return
+
+    # Try expenses
+    exp = con.execute(
+        "SELECT * FROM expenses WHERE id = ? AND chat_id = ?",
+        (tx_id, chat_id)
+    ).fetchone()
+    if exp:
+        con.execute("DELETE FROM expenses WHERE id = ?", (tx_id,))
+        con.commit()
+        con.close()
+        await update.message.reply_text(
+            f"Depense #{tx_id} supprimee\n"
+            f"   Paye par {exp['paid_by']} : {exp['amount']:.0f} {cur(chat_id)}\n"
+            f"   Motif : {exp['description']}"
+        )
+        return
+
+    con.close()
+    await update.message.reply_text(f"Transaction/depense #{tx_id} introuvable.")
 
 
 # ── /depense — Frais partagé (Tricount) ─────────────────────
@@ -1113,6 +1164,7 @@ def main():
     app.add_handler(CommandHandler("dettes", cmd_dettes))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("deletetx", cmd_deletetx))
     app.add_handler(CommandHandler("remb", cmd_remb))
     app.add_handler(CommandHandler("depense", cmd_depense))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1135,6 +1187,7 @@ def main():
             ("depense", "Depense partagee (duo)"),
             ("remb", "Remboursement / transfert"),
             ("delete", "Supprimer un pari"),
+            ("deletetx", "Supprimer un remb/depense"),
             ("help", "Aide et commandes"),
         ])
     app.post_init = post_init
