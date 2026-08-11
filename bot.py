@@ -854,7 +854,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
             "  /delete <id> — supprimer un pari\n"
-            "  /deletetx <id> — supprimer un remb/depense"
+            "  /deletetx <id> — supprimer un remb"
         )
     await update.message.reply_text(text)
 
@@ -1191,6 +1191,7 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     con = db()
+    # Clear existing data for this chat
     con.execute("DELETE FROM bets WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM transactions WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM expenses WHERE chat_id = ?", (chat_id,))
@@ -1247,6 +1248,7 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Utilisez /pending ou /historique pour verifier."
     )
 
+
 # ── Main ────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -1255,6 +1257,22 @@ def main():
 
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("lock", "Enregistrer un pari"),
+            ("solde", "Voir le solde P&L"),
+            ("dettes", "Voir qui doit quoi"),
+            ("pending", "Paris en cours"),
+            ("historique", "Derniers paris resolus"),
+            ("stats", "Statistiques detaillees"),
+            ("depense", "Depense partagee (duo)"),
+            ("remb", "Remboursement / transfert"),
+            ("delete", "Supprimer un pari"),
+            ("deletetx", "Supprimer un remb/depense"),
+            ("help", "Aide et commandes"),
+        ])
+    app.post_init = post_init
 
     app.add_handler(CommandHandler("lock", cmd_lock))
     for cmd in ["win", "w", "gagne", "loss", "lose", "l", "perdu", "void", "push", "annule"]:
@@ -1278,22 +1296,6 @@ def main():
         on_reply_result
     ))
 
-
-    async def post_init(application):
-        await application.bot.set_my_commands([
-            ("lock", "Enregistrer un pari"),
-            ("solde", "Voir le solde P&L"),
-            ("dettes", "Voir qui doit quoi"),
-            ("pending", "Paris en cours"),
-            ("historique", "Derniers paris resolus"),
-            ("stats", "Statistiques detaillees"),
-            ("depense", "Depense partagee (duo)"),
-            ("remb", "Remboursement / transfert"),
-            ("delete", "Supprimer un pari"),
-            ("deletetx", "Supprimer un remb/depense"),
-            ("help", "Aide et commandes"),
-        ])
-    app.post_init = post_init
     log.info(f"Bot started (DUO_CHAT_ID={DUO_CHAT_ID})")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
