@@ -24,7 +24,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
 NB_PARTS = 3
-DB_PATH = "/data/bets.db"
+DB_PATH = os.environ.get("DB_PATH", "/data/bets.db")
 DUO_CHAT_ID = int(os.environ.get("DUO_CHAT_ID", "0"))
 SHEET_ID_GROUP = "1izpo65I_FgrTUaarqiGCJHv7VQ2A-ixMOcnb7PJrU7k"
 SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
@@ -960,6 +960,12 @@ async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   {tx['from_name']} -> {tx['to_name']} : {tx['amount']:.0f} {cur(chat_id)}\n"
             f"   Motif : {tx['description']}"
         )
+        sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
+        await sync_sheets({
+            "action": "delete_transaction",
+            "id": tx_id,
+            "sheet_tab": sheet_tab
+        })
         return
 
     # Try expenses
@@ -976,6 +982,12 @@ async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   Paye par {exp['paid_by']} : {exp['amount']:.0f} {cur(chat_id)}\n"
             f"   Motif : {exp['description']}"
         )
+        sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
+        await sync_sheets({
+            "action": "delete_transaction",
+            "id": tx_id,
+            "sheet_tab": sheet_tab
+        })
         return
 
     con.close()
@@ -1145,6 +1157,87 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
+# ── /restore — Re-importer les paris depuis Google Sheets ───
+async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if not SHEETS_WEBHOOK_URL:
+        await update.message.reply_text("SHEETS_WEBHOOK_URL non configure.")
+        return
+
+    duo = is_duo(chat_id)
+    sheet_tab = "Kekko-Rapha" if duo else "Paris"
+    sheet_id = SHEET_ID_DUO if duo else SHEET_ID_GROUP
+    payload = {"action": "export_data", "sheet_tab": sheet_tab, "sheet_id": sheet_id}
+
+    await update.message.reply_text("Restauration en cours depuis Google Sheets...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    await update.message.reply_text(f"Erreur Sheets: HTTP {resp.status}")
+                    return
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur: {e}")
+        return
+
+    if data.get("status") != "ok":
+        await update.message.reply_text("Reponse invalide du serveur Sheets.")
+        return
+
+    con = db()
+    con.execute("DELETE FROM bets WHERE chat_id = ?", (chat_id,))
+    con.execute("DELETE FROM transactions WHERE chat_id = ?", (chat_id,))
+    con.execute("DELETE FROM expenses WHERE chat_id = ?", (chat_id,))
+
+    nb_bets = 0
+    for b in data.get("bets", []):
+        bet_id = b.get("id")
+        if not bet_id:
+            continue
+        status = (b.get("status") or "PENDING").strip().upper()
+        status_map = {"WON": "won", "LOST": "lost", "PENDING": "pending", "VOID": "void"}
+        status = status_map.get(status, "pending")
+        date_str = str(b.get("date", ""))[:10]
+        con.execute(
+            "INSERT OR REPLACE INTO bets (id, chat_id, description, stake, odds, user_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(bet_id), chat_id, b.get("description", ""), float(b.get("stake", 0)),
+             float(b.get("odds", 0)), b.get("user_name", ""), status, date_str)
+        )
+        nb_bets += 1
+
+    nb_tx = 0
+    for t in data.get("transactions", []):
+        tx_id = t.get("id")
+        if not tx_id:
+            continue
+        to_name = t.get("to_name", "")
+        date_str = str(t.get("date", ""))[:10]
+        if to_name == "DEPENSE":
+            con.execute(
+                "INSERT OR REPLACE INTO expenses (id, chat_id, paid_by, amount, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(tx_id), chat_id, t.get("from_name", ""), float(t.get("amount", 0)),
+                 t.get("description", ""), date_str)
+            )
+        else:
+            con.execute(
+                "INSERT OR REPLACE INTO transactions (id, chat_id, from_name, to_name, amount, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(tx_id), chat_id, t.get("from_name", ""), to_name,
+                 float(t.get("amount", 0)), t.get("description", ""), date_str)
+            )
+        nb_tx += 1
+
+    con.commit()
+    con.close()
+
+    await update.message.reply_text(
+        f"Restauration terminee !\n"
+        f"  {nb_bets} paris importes\n"
+        f"  {nb_tx} transactions importees\n\n"
+        f"Utilisez /pending ou /historique pour verifier."
+    )
+
 # ── Main ────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -1169,6 +1262,7 @@ def main():
     app.add_handler(CommandHandler("depense", cmd_depense))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
+    app.add_handler(CommandHandler("restore", cmd_restore))
 
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
