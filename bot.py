@@ -28,6 +28,8 @@ DB_PATH = os.environ.get("DB_PATH", "/data/bets.db")
 DUO_CHAT_ID = int(os.environ.get("DUO_CHAT_ID", "0"))
 SHEET_ID_GROUP = "1izpo65I_FgrTUaarqiGCJHv7VQ2A-ixMOcnb7PJrU7k"
 SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
+GROUP_DEFAULT_BETTOR = "Marco"
+NAME_MAP = {"Twix": "Kekko"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -266,7 +268,13 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Optional @name override after odds
     remainder = raw[m.end():].strip()
     override = re.match(r'@\s*(\S+)', remainder)
-    bettor_name = override.group(1).strip().capitalize() if override else user.first_name
+    if override:
+        bettor_name = override.group(1).strip().capitalize()
+    elif not is_duo(chat_id):
+        bettor_name = GROUP_DEFAULT_BETTOR
+    else:
+        raw = user.first_name
+        bettor_name = NAME_MAP.get(raw, raw)
     now = datetime.now(timezone.utc).isoformat()
 
     con = db()
@@ -1012,7 +1020,8 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     first = ctx.args[0]
     try:
         amount = float(first.replace(",", "."))
-        paid_by = update.message.from_user.first_name
+        raw_name = update.message.from_user.first_name
+        paid_by = NAME_MAP.get(raw_name, raw_name)
         description = " ".join(ctx.args[1:]).strip() or "Depense partagee"
     except ValueError:
         paid_by = first.capitalize()
@@ -1190,40 +1199,45 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.execute("DELETE FROM bets WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM transactions WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM expenses WHERE chat_id = ?", (chat_id,))
+    # Reset auto-increment so new IDs start after the highest remaining ID
+    for tbl in ("bets", "transactions", "expenses"):
+        max_id = con.execute(f"SELECT COALESCE(MAX(id), 0) FROM {tbl}").fetchone()[0]
+        if max_id > 0:
+            con.execute(f"UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (max_id, tbl))
+        else:
+            con.execute(f"DELETE FROM sqlite_sequence WHERE name = ?", (tbl,))
 
     nb_bets = 0
     for b in data.get("bets", []):
-        bet_id = b.get("id")
-        if not bet_id:
+        if not b.get("id"):
             continue
         status = (b.get("status") or "PENDING").strip().upper()
         status_map = {"WON": "won", "LOST": "lost", "PENDING": "pending", "VOID": "void"}
         status = status_map.get(status, "pending")
         date_str = str(b.get("date", ""))[:10]
         con.execute(
-            "INSERT OR REPLACE INTO bets (id, chat_id, description, stake, odds, user_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (int(bet_id), chat_id, b.get("description", ""), float(b.get("stake", 0)),
+            "INSERT INTO bets (chat_id, description, stake, odds, user_name, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, b.get("description", ""), float(b.get("stake", 0)),
              float(b.get("odds", 0)), b.get("user_name", ""), status, date_str)
         )
         nb_bets += 1
 
     nb_tx = 0
     for t in data.get("transactions", []):
-        tx_id = t.get("id")
-        if not tx_id:
+        if not t.get("id"):
             continue
         to_name = t.get("to_name", "")
         date_str = str(t.get("date", ""))[:10]
         if to_name == "DEPENSE":
             con.execute(
-                "INSERT OR REPLACE INTO expenses (id, chat_id, paid_by, amount, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (int(tx_id), chat_id, t.get("from_name", ""), float(t.get("amount", 0)),
+                "INSERT INTO expenses (chat_id, paid_by, amount, description, created_at) VALUES (?, ?, ?, ?, ?)",
+                (chat_id, t.get("from_name", ""), float(t.get("amount", 0)),
                  t.get("description", ""), date_str)
             )
         else:
             con.execute(
-                "INSERT OR REPLACE INTO transactions (id, chat_id, from_name, to_name, amount, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (int(tx_id), chat_id, t.get("from_name", ""), to_name,
+                "INSERT INTO transactions (chat_id, from_name, to_name, amount, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, t.get("from_name", ""), to_name,
                  float(t.get("amount", 0)), t.get("description", ""), date_str)
             )
         nb_tx += 1
