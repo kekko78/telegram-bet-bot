@@ -6,7 +6,7 @@ Deux modes :
 
 Usage principal :
   /lock 800 Strasbourg 1N2 3,10
-  → Enregistre un pari
+  → Enregistre un par
 """
 import os
 import re
@@ -683,7 +683,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Split mode (original) ──
     rows = con.execute(
-        "SELECT user_id, user_name, stake, odds, status FROM bets "
+        "SELECT user_name, stake, odds, status FROM bets "
         "WHERE chat_id = ? AND status IN ('won','lost','pending')",
         (chat_id,)
     ).fetchall()
@@ -696,39 +696,34 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     fronted = {}
     collected = {}
-    names = {}
     total_cost = total_returns = 0.0
 
     for r in rows:
-        uid = r["user_id"]
-        names[uid] = r["user_name"]
-        fronted[uid] = fronted.get(uid, 0) + r["stake"]
+        name = r["user_name"]
+        fronted[name] = fronted.get(name, 0) + r["stake"]
         total_cost += r["stake"]
         if r["status"] == "won":
             payout = r["stake"] * r["odds"]
-            collected[uid] = collected.get(uid, 0) + payout
+            collected[name] = collected.get(name, 0) + payout
             total_returns += payout
 
+    # Include participants from both bets and transactions
+    all_names = set(fronted) | set(collected) | set(tx_net.keys())
     balances = {}
-    all_uids = set(fronted) | set(collected)
-    for uid in all_uids:
-        f = fronted.get(uid, 0)
-        c_ = collected.get(uid, 0)
+    for name in all_names:
+        f = fronted.get(name, 0)
+        c_ = collected.get(name, 0)
         physical = c_ - f
         fair = (total_returns - total_cost) / NB_PARTS
-        balances[uid] = fair - physical
+        balances[name] = fair - physical
 
-    # Apply transactions: name-based adjustments to uid-based balances
-    name_to_uid = {v: k for k, v in names.items()}
+    # Apply transactions
     for name, net_sent in tx_net.items():
-        uid = name_to_uid.get(name)
-        if uid is not None:
-            balances[uid] = balances.get(uid, 0) + net_sent
+        balances[name] = balances.get(name, 0) + net_sent
 
     c = cur(chat_id)
     lines = ["DETTES\n"]
-    for uid, bal in sorted(balances.items(), key=lambda x: x[1]):
-        name = names.get(uid, "?")
+    for name, bal in sorted(balances.items(), key=lambda x: x[1]):
         if bal > 0.5:
             lines.append(f"  {name} : on lui doit {abs(bal):.0f} {c}")
         elif bal < -0.5:
@@ -736,8 +731,8 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"  {name} : a jour")
 
-    debtors = sorted([(uid, -bal) for uid, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
-    creditors = sorted([(uid, bal) for uid, bal in balances.items() if bal > 0.5], key=lambda x: -x[1])
+    debtors = sorted([(n, -bal) for n, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
+    creditors = sorted([(n, bal) for n, bal in balances.items() if bal > 0.5], key=lambda x: -x[1])
     if debtors and creditors:
         lines.append("\nReglements :")
         di = ci = 0
@@ -745,7 +740,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cr = list(creditors)
         while di < len(d) and ci < len(cr):
             transfer = min(d[di][1], cr[ci][1])
-            lines.append(f"  {names[d[di][0]]} → {names[cr[ci][0]]} : {transfer:.0f} {c}")
+            lines.append(f"  {d[di][0]} → {cr[ci][0]} : {transfer:.0f} {c}")
             d[di] = (d[di][0], d[di][1] - transfer)
             cr[ci] = (cr[ci][0], cr[ci][1] - transfer)
             if d[di][1] < 0.5: di += 1
