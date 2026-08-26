@@ -32,6 +32,35 @@ GROUP_DEFAULT_BETTOR = "Marco"
 ANNEXE_HANDLER = "Kekko"  # Alex handles annexe payments/recoveries
 NAME_MAP = {"Twix": "Kekko"}
 
+def parse_name_override(raw: str, update) -> tuple:
+    """Parse @name from text OR Telegram mention entities.
+    Returns (name_or_None, cleaned_raw).
+    Handles autocomplete mentions where Telegram strips the @ character.
+    """
+    # 1. Try literal @name in text
+    m = re.search(r'@\s*(\S+)\s*$', raw)
+    if m:
+        name = m.group(1).strip().capitalize()
+        name = NAME_MAP.get(name, name)
+        return name, raw[:m.start()].strip()
+    # 2. Try Telegram mention entities (autocomplete strips @)
+    if update.message and update.message.entities:
+        for entity in update.message.entities:
+            if entity.type == "mention":
+                text = update.message.text[entity.offset:entity.offset + entity.length]
+                name = text.lstrip("@").strip().capitalize()
+                name = NAME_MAP.get(name, name)
+                clean = text.lstrip("@")
+                raw = re.sub(r'\s*' + re.escape(clean) + r'\s*$', '', raw, flags=re.IGNORECASE).strip()
+                return name, raw
+            elif entity.type == "text_mention":
+                raw_name = entity.user.first_name
+                name = NAME_MAP.get(raw_name, raw_name)
+                display = update.message.text[entity.offset:entity.offset + entity.length]
+                raw = re.sub(r'\s*' + re.escape(display) + r'\s*$', '', raw, flags=re.IGNORECASE).strip()
+                return name, raw
+    return None, raw
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -331,17 +360,36 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     chat_id = update.message.chat_id
 
-    # Optional @name override after odds
+    # Optional @name override after odds (handles text @name and Telegram mention entities)
     remainder = raw[m.end():].strip()
     override = re.match(r'@\s*(\S+)', remainder)
     if override:
         bettor_name = override.group(1).strip().capitalize()
+        bettor_name = NAME_MAP.get(bettor_name, bettor_name)
         remainder = remainder[override.end():].strip()
-    elif not is_duo(chat_id):
-        bettor_name = GROUP_DEFAULT_BETTOR
     else:
-        raw = user.first_name
-        bettor_name = NAME_MAP.get(raw, raw)
+        # Check Telegram mention entities (autocomplete strips @)
+        mention_name = None
+        if update.message and update.message.entities:
+            for entity in update.message.entities:
+                if entity.type in ("mention", "text_mention"):
+                    if entity.type == "mention":
+                        text = update.message.text[entity.offset:entity.offset + entity.length]
+                        mention_name = text.lstrip("@").strip().capitalize()
+                    else:
+                        mention_name = entity.user.first_name
+                    mention_name = NAME_MAP.get(mention_name, mention_name)
+                    # Remove from remainder
+                    display = update.message.text[entity.offset:entity.offset + entity.length].lstrip("@")
+                    remainder = re.sub(r'\s*' + re.escape(display), '', remainder, flags=re.IGNORECASE).strip()
+                    break
+        if mention_name:
+            bettor_name = mention_name
+        elif not is_duo(chat_id):
+            bettor_name = GROUP_DEFAULT_BETTOR
+        else:
+            raw = user.first_name
+            bettor_name = NAME_MAP.get(raw, raw)
 
     # Parse -NomAnnexe MONTANT (group mode only)
     annexe_name = None
@@ -1198,13 +1246,8 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Parse: either "/depense 80 desc" or "/depense Rapha 50 desc"
     raw = " ".join(ctx.args)
 
-    # Check for @name override at end
-    override_match = re.search(r'@\s*(\S+)\s*$', raw)
-    if override_match:
-        paid_by = override_match.group(1).strip().capitalize()
-        raw = raw[:override_match.start()].strip()
-    else:
-        paid_by = None
+    # Check for @name override (handles both text @name and Telegram mention entities)
+    paid_by, raw = parse_name_override(raw, update)
 
     # Parse amount + description
     first = raw.split()[0] if raw else ""
@@ -1288,12 +1331,9 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw = " ".join(ctx.args)
 
-    # Check for @name override at end
-    override_match = re.search(r'@\s*(\S+)\s*$', raw)
-    if override_match:
-        received_by = override_match.group(1).strip().capitalize()
-        raw = raw[:override_match.start()].strip()
-    else:
+    # Check for @name override (handles both text @name and Telegram mention entities)
+    received_by, raw = parse_name_override(raw, update)
+    if not received_by:
         raw_name = update.message.from_user.first_name
         received_by = NAME_MAP.get(raw_name, raw_name)
 
