@@ -146,6 +146,65 @@ def format_tricount_balance(tc: dict, chat_id: int) -> str:
     return "Vous etes a jour !"
 
 
+def get_group_tricount(con, chat_id: int) -> dict:
+    """Tricount balance for group mode (3-way split).
+    Returns {name: balance} where positive = group owes you."""
+    bets = con.execute(
+        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND status != 'void'",
+        (chat_id,)
+    ).fetchall()
+    txs = con.execute(
+        "SELECT from_name, to_name, amount FROM transactions WHERE chat_id = ?", (chat_id,)
+    ).fetchall()
+    expenses = con.execute(
+        "SELECT paid_by, amount FROM expenses WHERE chat_id = ?", (chat_id,)
+    ).fetchall()
+
+    # Net outflow per person (positive = paid out, negative = received)
+    outflow = {}
+
+    for b in bets:
+        name = b["user_name"]
+        outflow[name] = outflow.get(name, 0) + b["stake"]
+        if b["status"] == "won":
+            outflow[name] -= b["stake"] * b["odds"]
+
+    for e in expenses:
+        name = e["paid_by"]
+        # amount > 0: paid expense (outflow increases)
+        # amount < 0: retrait (outflow decreases = received money)
+        outflow[name] = outflow.get(name, 0) + e["amount"]
+
+    for t in txs:
+        outflow[t["from_name"]] = outflow.get(t["from_name"], 0) + t["amount"]
+        outflow[t["to_name"]] = outflow.get(t["to_name"], 0) - t["amount"]
+
+    total_outflow = sum(outflow.values())
+    fair_share = total_outflow / NB_PARTS
+
+    balances = {}
+    for name, out in outflow.items():
+        balances[name] = out - fair_share
+    return balances
+
+
+def format_group_tricount(balances: dict, chat_id: int) -> str:
+    if not balances:
+        return "Pas encore de donnees"
+    c = cur(chat_id)
+    # Find settlements
+    debtors = [(n, -b) for n, b in balances.items() if b < -0.5]
+    creditors = [(n, b) for n, b in balances.items() if b > 0.5]
+    if not debtors and not creditors:
+        return "Tout le monde est a jour"
+    parts = []
+    for n, amt in sorted(creditors, key=lambda x: -x[1]):
+        parts.append(f"on doit {amt:.0f} {c} a {n}")
+    for n, amt in sorted(debtors, key=lambda x: -x[1]):
+        parts.append(f"{n} doit {amt:.0f} {c}")
+    return " | ".join(parts)
+
+
 def get_transactions_net(con, chat_id: int) -> dict:
     """Returns {name: net_amount_sent}. Positive = has sent more than received."""
     rows = con.execute(
@@ -492,6 +551,11 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "SELECT status, stake, odds FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
             (chat_id,)
         ).fetchall()
+        expenses = con.execute(
+            "SELECT paid_by, amount, description FROM expenses WHERE chat_id = ?",
+            (chat_id,)
+        ).fetchall()
+        balances = get_group_tricount(con, chat_id)
         con.close()
 
         total_pnl = 0.0
@@ -509,16 +573,26 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         total = wins + losses
         wr = (wins / total * 100) if total > 0 else 0
         roi = (total_pnl / (total_staked / NB_PARTS) * 100) if total_staked > 0 else 0
+        c = cur(chat_id)
+
+        total_depots = sum(e["amount"] for e in expenses if e["amount"] > 0)
+        total_retraits = sum(-e["amount"] for e in expenses if e["amount"] < 0)
 
         text = (
             f"SOLDE DU GROUPE\n\n"
             f"P&L par personne : {fmt(total_pnl, chat_id)}\n"
             f"Paris : {wins}W - {losses}L ({wr:.0f}%)\n"
             f"ROI : {roi:+.1f}%\n"
-            f"Mise totale : {total_staked:.0f} {cur(chat_id)}"
+            f"Mise totale : {total_staked:.0f} {c}"
         )
+        if total_depots > 0:
+            text += f"\nDepots : {total_depots:.0f} {c}"
+        if total_retraits > 0:
+            text += f"\nRetraits : {total_retraits:.0f} {c}"
         if pending[0] > 0:
-            text += f"\n\nEn attente : {pending[0]} paris ({pending[1]:.0f} {cur(chat_id)})"
+            text += f"\n\nEn attente : {pending[0]} paris ({pending[1]:.0f} {c})"
+        if balances:
+            text += f"\n\n{format_group_tricount(balances, chat_id)}"
         await update.message.reply_text(text)
 
 
@@ -681,48 +755,33 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
         return
 
-    # ── Split mode (original) ──
-    rows = con.execute(
-        "SELECT user_name, stake, odds, status FROM bets "
-        "WHERE chat_id = ? AND status IN ('won','lost','pending')",
+    # ── Group tricount mode ──
+    balances = get_group_tricount(con, chat_id)
+
+    # Get extra info for display
+    bets_rows = con.execute(
+        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
         (chat_id,)
     ).fetchall()
-    tx_net = get_transactions_net(con, chat_id)
+    pending_rows = con.execute(
+        "SELECT user_name, COUNT(*) as cnt, SUM(stake) as total FROM bets WHERE chat_id = ? AND status = 'pending' GROUP BY user_name",
+        (chat_id,)
+    ).fetchall()
+    exp_rows = con.execute(
+        "SELECT * FROM expenses WHERE chat_id = ? ORDER BY id DESC LIMIT 10",
+        (chat_id,)
+    ).fetchall()
+    tx_list = get_transactions_list(con, chat_id)
     con.close()
 
-    if not rows and not tx_net:
-        await update.message.reply_text("Aucun pari enregistre.")
+    if not balances and not bets_rows:
+        await update.message.reply_text("Aucune donnee.")
         return
-
-    fronted = {}
-    collected = {}
-    total_cost = total_returns = 0.0
-
-    for r in rows:
-        name = r["user_name"]
-        fronted[name] = fronted.get(name, 0) + r["stake"]
-        total_cost += r["stake"]
-        if r["status"] == "won":
-            payout = r["stake"] * r["odds"]
-            collected[name] = collected.get(name, 0) + payout
-            total_returns += payout
-
-    # Include participants from both bets and transactions
-    all_names = set(fronted) | set(collected) | set(tx_net.keys())
-    balances = {}
-    for name in all_names:
-        f = fronted.get(name, 0)
-        c_ = collected.get(name, 0)
-        physical = c_ - f
-        fair = (total_returns - total_cost) / NB_PARTS
-        balances[name] = fair - physical
-
-    # Apply transactions
-    for name, net_sent in tx_net.items():
-        balances[name] = balances.get(name, 0) + net_sent
 
     c = cur(chat_id)
     lines = ["DETTES\n"]
+
+    # Show balances
     for name, bal in sorted(balances.items(), key=lambda x: x[1]):
         if bal > 0.5:
             lines.append(f"  {name} : on lui doit {abs(bal):.0f} {c}")
@@ -731,6 +790,43 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"  {name} : a jour")
 
+    # P&L from bets
+    total_pnl = 0.0
+    wins = losses = 0
+    for r in bets_rows:
+        pnl = bet_pnl(r["stake"], r["odds"], r["status"])
+        total_pnl += pnl
+        if r["status"] == "won":
+            wins += 1
+        else:
+            losses += 1
+    if wins + losses > 0:
+        lines.append(f"\n--- Paris : {wins}W-{losses}L, P&L {fmt(total_pnl / NB_PARTS, chat_id)}/pers. ---")
+
+    # Pending
+    for p in pending_rows:
+        lines.append(f"  {p['user_name']} : {p['cnt']} pending ({p['total']:.0f} {c})")
+
+    # Expenses & retraits
+    deps = [e for e in exp_rows if e["amount"] > 0]
+    rets = [e for e in exp_rows if e["amount"] < 0]
+    if deps:
+        lines.append("\n--- Depenses ---")
+        for e in deps[:5]:
+            lines.append(f"  #{e['id']} {e['paid_by']} a paye {e['amount']:.0f} {c} ({e['description']})")
+    if rets:
+        lines.append("\n--- Retraits ---")
+        for e in rets[:5]:
+            desc = e['description'].replace("[RETRAIT] ", "")
+            lines.append(f"  #{e['id']} {e['paid_by']} a recu {abs(e['amount']):.0f} {c} ({desc})")
+
+    # Transfers
+    if tx_list:
+        lines.append("\n--- Transferts ---")
+        for tx in tx_list[:5]:
+            lines.append(f"  {tx['from_name']}→{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
+
+    # Settlement suggestions
     debtors = sorted([(n, -bal) for n, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
     creditors = sorted([(n, bal) for n, bal in balances.items() if bal > 0.5], key=lambda x: -x[1])
     if debtors and creditors:
@@ -846,7 +942,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /loss (repondre au pari ou /loss <id>)\n"
             "  /void (annule/rembourse)\n\n"
             "Transactions :\n"
-            "  /remb Marco 100 a Kekko — enregistrer un remboursement\n\n"
+            "  /remb Marco 100 a Kekko — transfert direct\n"
+            "  /depense 935 bet365 depot @Kekko — avance partagee\n"
+            "  /retrait 6000 bet365 @Kekko — retrait partage\n\n"
             "Stats :\n"
             "  /solde — P&L du groupe\n"
             "  /dettes — qui doit quoi a qui\n"
@@ -854,7 +952,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
             "  /delete <id> — supprimer un pari\n"
-            "  /deletetx <id> — supprimer un remb"
+            "  /deletetx <id> — supprimer un remb/depense"
         )
     await update.message.reply_text(text)
 
@@ -1000,35 +1098,50 @@ async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /depense — Frais partagé (Tricount) ─────────────────────
 async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    if not is_duo(chat_id):
-        await update.message.reply_text("Cette commande est reservee au mode duo.")
-        return
+    duo = is_duo(chat_id)
+    parts = 2 if duo else NB_PARTS
 
     if not ctx.args:
         await update.message.reply_text(
-            "Format : /depense <montant> <description>\n"
+            "Format : /depense <montant> <description> [@nom]\n"
             "Ex: /depense 80 restaurant\n"
-            "Ex: /depense Rapha 50 uber"
+            "Ex: /depense 935 bet365 depot @Kekko"
         )
         return
 
-    first = ctx.args[0]
+    # Parse: either "/depense 80 desc" or "/depense Rapha 50 desc"
+    raw = " ".join(ctx.args)
+
+    # Check for @name override at end
+    override_match = re.search(r'@\s*(\S+)\s*$', raw)
+    if override_match:
+        paid_by = override_match.group(1).strip().capitalize()
+        raw = raw[:override_match.start()].strip()
+    else:
+        paid_by = None
+
+    # Parse amount + description
+    first = raw.split()[0] if raw else ""
     try:
         amount = float(first.replace(",", "."))
-        raw_name = update.message.from_user.first_name
-        paid_by = NAME_MAP.get(raw_name, raw_name)
-        description = " ".join(ctx.args[1:]).strip() or "Depense partagee"
+        description = raw[len(first):].strip() or "Depense partagee"
+        if not paid_by:
+            raw_name = update.message.from_user.first_name
+            paid_by = NAME_MAP.get(raw_name, raw_name)
     except ValueError:
-        paid_by = first.capitalize()
-        if len(ctx.args) < 2:
+        if not paid_by:
+            paid_by = first.capitalize()
+        rest = raw[len(first):].strip()
+        if not rest:
             await update.message.reply_text("Montant manquant.\nEx: /depense 80 restaurant")
             return
+        amt_str = rest.split()[0]
         try:
-            amount = float(ctx.args[1].replace(",", "."))
+            amount = float(amt_str.replace(",", "."))
         except ValueError:
             await update.message.reply_text("Montant invalide.\nEx: /depense 80 restaurant")
             return
-        description = " ".join(ctx.args[2:]).strip() or "Depense partagee"
+        description = rest[len(amt_str):].strip() or "Depense partagee"
 
     if amount <= 0:
         await update.message.reply_text("Montant invalide.")
@@ -1045,18 +1158,23 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     exp_id = cur_.lastrowid
     con.commit()
 
-    tc = get_duo_tricount(con, chat_id)
-    balance_text = format_tricount_balance(tc, chat_id)
+    if duo:
+        tc = get_duo_tricount(con, chat_id)
+        balance_text = format_tricount_balance(tc, chat_id)
+    else:
+        balances = get_group_tricount(con, chat_id)
+        balance_text = format_group_tricount(balances, chat_id)
     con.close()
 
     text = (
         f"Depense #{exp_id} enregistree\n"
         f"   {paid_by} a paye {amount:.0f} {c} ({description})\n"
-        f"   Part de chacun : {amount/2:.0f} {c}\n\n"
+        f"   Part de chacun : {amount/parts:.0f} {c}\n\n"
         f"Balance : {balance_text}"
     )
     await update.message.reply_text(text)
 
+    sheet_tab = "Kekko-Rapha" if duo else "Paris"
     await sync_sheets({
         "action": "expense",
         "id": exp_id,
@@ -1064,7 +1182,85 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "paid_by": paid_by,
         "amount": amount,
         "description": description,
-        "sheet_tab": "Kekko-Rapha"
+        "sheet_tab": sheet_tab
+    })
+
+
+# ── /retrait — Retrait partagé (inverse de depense) ──────────
+async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    duo = is_duo(chat_id)
+    parts = 2 if duo else NB_PARTS
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "Format : /retrait <montant> <description> [@nom]\n"
+            "Ex: /retrait 6000 bet365 @Kekko\n"
+            "Le montant est reparti : chacun recoit sa part."
+        )
+        return
+
+    raw = " ".join(ctx.args)
+
+    # Check for @name override at end
+    override_match = re.search(r'@\s*(\S+)\s*$', raw)
+    if override_match:
+        received_by = override_match.group(1).strip().capitalize()
+        raw = raw[:override_match.start()].strip()
+    else:
+        raw_name = update.message.from_user.first_name
+        received_by = NAME_MAP.get(raw_name, raw_name)
+
+    # Parse amount + description
+    first = raw.split()[0] if raw else ""
+    try:
+        amount = float(first.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Montant invalide.\nEx: /retrait 6000 bet365 @Kekko")
+        return
+    description = raw[len(first):].strip() or "Retrait"
+
+    if amount <= 0:
+        await update.message.reply_text("Montant invalide.")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    c = cur(chat_id)
+
+    # Store as negative expense: received_by got money FROM the group
+    con = db()
+    cur_ = con.execute(
+        "INSERT INTO expenses (chat_id, paid_by, amount, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, received_by, -amount, f"[RETRAIT] {description}", now)
+    )
+    exp_id = cur_.lastrowid
+    con.commit()
+
+    if duo:
+        tc = get_duo_tricount(con, chat_id)
+        balance_text = format_tricount_balance(tc, chat_id)
+    else:
+        balances = get_group_tricount(con, chat_id)
+        balance_text = format_group_tricount(balances, chat_id)
+    con.close()
+
+    text = (
+        f"Retrait #{exp_id} enregistre\n"
+        f"   {received_by} a recu {amount:.0f} {c} ({description})\n"
+        f"   Part de chacun : {amount/parts:.0f} {c}\n\n"
+        f"Balance : {balance_text}"
+    )
+    await update.message.reply_text(text)
+
+    sheet_tab = "Kekko-Rapha" if duo else "Paris"
+    await sync_sheets({
+        "action": "expense",
+        "id": exp_id,
+        "date": now[:10],
+        "paid_by": received_by,
+        "amount": -amount,
+        "description": f"[RETRAIT] {description}",
+        "sheet_tab": sheet_tab
     })
 
 
@@ -1161,96 +1357,6 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
-# ── /sync — Pousser l'état de la DB vers Google Sheets ────────
-async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Export all bets + transactions from DB to Sheet (reverse of /restore)."""
-    chat_id = update.message.chat_id
-    if not SHEETS_WEBHOOK_URL:
-        await update.message.reply_text("SHEETS_WEBHOOK_URL non configure.")
-        return
-
-    duo = is_duo(chat_id)
-    sheet_tab = "Kekko-Rapha" if duo else "Paris"
-    sheet_id = SHEET_ID_DUO if duo else SHEET_ID_GROUP
-
-    con = db()
-    bets = con.execute(
-        "SELECT * FROM bets WHERE chat_id = ? ORDER BY id",
-        (chat_id,)
-    ).fetchall()
-    transactions = con.execute(
-        "SELECT * FROM transactions WHERE chat_id = ? ORDER BY id",
-        (chat_id,)
-    ).fetchall()
-    expenses = con.execute(
-        "SELECT * FROM expenses WHERE chat_id = ? ORDER BY id",
-        (chat_id,)
-    ).fetchall()
-    con.close()
-
-    bets_data = []
-    for b in bets:
-        bets_data.append({
-            "id": b["id"],
-            "date": (b["created_at"] or "")[:10],
-            "description": b["description"],
-            "stake": b["stake"],
-            "odds": b["odds"],
-            "user_name": b["user_name"],
-            "status": b["status"]
-        })
-
-    tx_data = []
-    for t in transactions:
-        tx_data.append({
-            "id": t["id"],
-            "date": (t["created_at"] or "")[:10],
-            "from_name": t["from_name"],
-            "to_name": t["to_name"],
-            "amount": t["amount"],
-            "description": t["description"]
-        })
-
-    exp_data = []
-    for e in expenses:
-        exp_data.append({
-            "id": e["id"],
-            "date": (e["created_at"] or "")[:10],
-            "paid_by": e["paid_by"],
-            "amount": e["amount"],
-            "description": e["description"]
-        })
-
-    payload = {
-        "action": "full_sync",
-        "sheet_id": sheet_id,
-        "sheet_tab": sheet_tab,
-        "bets": bets_data,
-        "transactions": tx_data,
-        "expenses": exp_data
-    }
-
-    await update.message.reply_text(
-        f"Sync en cours... ({len(bets_data)} paris, {len(tx_data)} tx, {len(exp_data)} dep)"
-    )
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status == 200:
-                    await update.message.reply_text(
-                        f"Sync terminee !\n"
-                        f"  {len(bets_data)} paris\n"
-                        f"  {len(tx_data)} transactions\n"
-                        f"  {len(exp_data)} depenses\n\n"
-                        f"Le Google Sheet est maintenant a jour."
-                    )
-                else:
-                    await update.message.reply_text(f"Erreur Sheets: HTTP {resp.status}")
-    except Exception as e:
-        await update.message.reply_text(f"Erreur: {e}")
-
-
 # ── /restore — Re-importer les paris depuis Google Sheets ───
 async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1281,7 +1387,6 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     con = db()
-    # Clear existing data for this chat
     con.execute("DELETE FROM bets WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM transactions WHERE chat_id = ?", (chat_id,))
     con.execute("DELETE FROM expenses WHERE chat_id = ?", (chat_id,))
@@ -1338,7 +1443,6 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Utilisez /pending ou /historique pour verifier."
     )
 
-
 # ── Main ────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -1347,22 +1451,6 @@ def main():
 
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-
-    async def post_init(application):
-        await application.bot.set_my_commands([
-            ("lock", "Enregistrer un pari"),
-            ("solde", "Voir le solde P&L"),
-            ("dettes", "Voir qui doit quoi"),
-            ("pending", "Paris en cours"),
-            ("historique", "Derniers paris resolus"),
-            ("stats", "Statistiques detaillees"),
-            ("depense", "Depense partagee (duo)"),
-            ("remb", "Remboursement / transfert"),
-            ("delete", "Supprimer un pari"),
-            ("deletetx", "Supprimer un remb/depense"),
-            ("help", "Aide et commandes"),
-        ])
-    app.post_init = post_init
 
     app.add_handler(CommandHandler("lock", cmd_lock))
     for cmd in ["win", "w", "gagne", "loss", "lose", "l", "perdu", "void", "push", "annule"]:
@@ -1377,16 +1465,33 @@ def main():
     app.add_handler(CommandHandler("deletetx", cmd_deletetx))
     app.add_handler(CommandHandler("remb", cmd_remb))
     app.add_handler(CommandHandler("depense", cmd_depense))
+    app.add_handler(CommandHandler("retrait", cmd_retrait))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("restore", cmd_restore))
-    app.add_handler(CommandHandler("sync", cmd_sync))
 
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
         on_reply_result
     ))
 
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("lock", "Enregistrer un pari"),
+            ("solde", "Voir le solde P&L"),
+            ("dettes", "Voir qui doit quoi"),
+            ("pending", "Paris en cours"),
+            ("historique", "Derniers paris resolus"),
+            ("stats", "Statistiques detaillees"),
+            ("depense", "Depense partagee"),
+            ("retrait", "Retrait partage"),
+            ("remb", "Remboursement / transfert"),
+            ("delete", "Supprimer un pari"),
+            ("deletetx", "Supprimer un remb/depense"),
+            ("help", "Aide et commandes"),
+        ])
+    app.post_init = post_init
     log.info(f"Bot started (DUO_CHAT_ID={DUO_CHAT_ID})")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
