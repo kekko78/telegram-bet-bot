@@ -6,7 +6,7 @@ Deux modes :
 
 Usage principal :
   /lock 800 Strasbourg 1N2 3,10
-  → Enregistre un par
+  → Enregistre un pari
 """
 import os
 import re
@@ -29,6 +29,7 @@ DUO_CHAT_ID = int(os.environ.get("DUO_CHAT_ID", "0"))
 SHEET_ID_GROUP = "1izpo65I_FgrTUaarqiGCJHv7VQ2A-ixMOcnb7PJrU7k"
 SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
 GROUP_DEFAULT_BETTOR = "Marco"
+ANNEXE_HANDLER = "Kekko"  # Alex handles annexe payments/recoveries
 NAME_MAP = {"Twix": "Kekko"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -263,6 +264,12 @@ def init_db():
             created_at  TEXT
         )
     """)
+    # Add annexe columns (safe to re-run)
+    for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0")]:
+        try:
+            con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     con.commit()
     con.close()
 
@@ -329,18 +336,32 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     override = re.match(r'@\s*(\S+)', remainder)
     if override:
         bettor_name = override.group(1).strip().capitalize()
+        remainder = remainder[override.end():].strip()
     elif not is_duo(chat_id):
         bettor_name = GROUP_DEFAULT_BETTOR
     else:
         raw = user.first_name
         bettor_name = NAME_MAP.get(raw, raw)
+
+    # Parse -NomAnnexe MONTANT (group mode only)
+    annexe_name = None
+    annexe_stake = 0.0
+    if not is_duo(chat_id):
+        annexe_match = re.search(r'-(\w+)\s+(\d+(?:[.,]\d+)?)', remainder)
+        if annexe_match:
+            annexe_name = annexe_match.group(1).capitalize()
+            annexe_stake = float(annexe_match.group(2).replace(",", "."))
+            if annexe_stake >= stake:
+                await update.message.reply_text("La mise annexe doit etre inferieure a la mise totale.")
+                return
+
     now = datetime.now(timezone.utc).isoformat()
 
     con = db()
     cur_ = con.execute(
-        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now)
+        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake)
     )
     bet_id = cur_.lastrowid
     con.commit()
@@ -361,6 +382,20 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Balance : {balance_text}\n"
             f"Resultat → repondre avec /win ou /loss"
         )
+    elif annexe_name:
+        trio_s = stake - annexe_stake
+        pp = trio_s / NB_PARTS
+        gain_pp = trio_s * (odds - 1) / NB_PARTS
+        text = (
+            f"Pari #{bet_id} enregistre\n"
+            f"   {desc} @ {odds:.2f}\n"
+            f"   Mise : {stake:.0f} {c}\n"
+            f"   ├ Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
+            f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
+            f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n"
+            f"   Avance {annexe_stake:.0f} {c} par {bettor_name} pour {annexe_name}\n\n"
+            f"Resultat → repondre a ce message avec /win ou /loss"
+        )
     else:
         pp = stake / NB_PARTS
         gain_pp = stake * (odds - 1) / NB_PARTS
@@ -374,7 +409,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
     sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
-    await sync_sheets({
+    sync_payload = {
         "action": "new_bet",
         "id": bet_id,
         "date": now[:10],
@@ -383,7 +418,11 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "odds": odds,
         "user_name": bettor_name,
         "sheet_tab": sheet_tab
-    })
+    }
+    if annexe_name:
+        sync_payload["annexe_name"] = annexe_name
+        sync_payload["annexe_stake"] = annexe_stake
+    await sync_sheets(sync_payload)
 
 
 # ── /win /loss /void — Résultat d'un pari ───────────────────
@@ -404,14 +443,14 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if msg.reply_to_message:
         bet = con.execute(
-            "SELECT * FROM bets WHERE chat_id = ? AND message_id = ? AND status = 'pending'",
+            "SELECT * FROM bets WHERE chat_id = ? AND message_id = ?",
             (chat_id, msg.reply_to_message.message_id)
         ).fetchone()
         if not bet and msg.reply_to_message.text:
             id_match = re.search(r"Pari #(\d+)", msg.reply_to_message.text)
             if id_match:
                 bet = con.execute(
-                    "SELECT * FROM bets WHERE id = ? AND chat_id = ? AND status = 'pending'",
+                    "SELECT * FROM bets WHERE id = ? AND chat_id = ?",
                     (int(id_match.group(1)), chat_id)
                 ).fetchone()
 
@@ -419,11 +458,17 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             bet_id = int(ctx.args[0])
             bet = con.execute(
-                "SELECT * FROM bets WHERE id = ? AND chat_id = ? AND status = 'pending'",
+                "SELECT * FROM bets WHERE id = ? AND chat_id = ?",
                 (bet_id, chat_id)
             ).fetchone()
         except (ValueError, IndexError):
             pass
+
+    # Si le pari a deja le statut demande, on ignore
+    if bet and bet["status"] == status:
+        con.close()
+        await msg.reply_text(f"Pari #{bet['id']} est deja {status.upper()}.")
+        return
 
     if not bet:
         pending = con.execute(
@@ -451,9 +496,11 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     stake = bet["stake"]
     odds = bet["odds"]
-    pnl = bet_pnl(stake, odds, status)
+    annexe_s = bet["annexe_stake"] or 0
+    annexe_n = bet["annexe_name"] or ""
 
     if is_duo(chat_id):
+        pnl = bet_pnl(stake, odds, status)
         if status == "won":
             result_text = f"GAGNE  {fmt(pnl, chat_id)}"
         elif status == "lost":
@@ -472,24 +519,36 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Balance : {debt_text}"
         )
     else:
+        trio_s = stake - annexe_s
+        trio_pnl = bet_pnl(trio_s, odds, status)
         if status == "won":
-            profit_pp = pnl / NB_PARTS
-            result_text = f"GAGNE  {fmt(profit_pp, chat_id)}/pers."
+            result_text = f"GAGNE  {fmt(trio_pnl / NB_PARTS, chat_id)}/pers."
         elif status == "lost":
-            result_text = f"PERDU  {fmt(pnl / NB_PARTS, chat_id)}/pers."
+            result_text = f"PERDU  {fmt(trio_pnl / NB_PARTS, chat_id)}/pers."
         else:
             result_text = f"ANNULE  0 {cur(chat_id)}"
 
         rows = con.execute(
-            "SELECT status, stake, odds FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
             (chat_id,)
         ).fetchall()
-        total_pnl = sum(bet_pnl(r["stake"], r["odds"], r["status"]) / NB_PARTS for r in rows)
+        total_pnl = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / NB_PARTS for r in rows)
         con.close()
+
+        annexe_text = ""
+        if annexe_s > 0 and status != "void":
+            c = cur(chat_id)
+            bettor = bet["user_name"]
+            if status == "won":
+                annexe_profit = annexe_s * (odds - 1)
+                annexe_text = f"\n   Annexe ({annexe_n}) : {bettor} doit {annexe_profit:.0f} {c} a {ANNEXE_HANDLER}"
+            elif status == "lost":
+                annexe_text = f"\n   Annexe ({annexe_n}) : avance de {annexe_s:.0f} {c} (inchangee)"
 
         text = (
             f"Pari #{bet['id']} : {result_text}\n"
-            f"   {bet['description']} @ {odds:.2f}\n\n"
+            f"   {bet['description']} @ {odds:.2f}"
+            f"{annexe_text}\n\n"
             f"P&L cumule : {fmt(total_pnl, chat_id)}/pers."
         )
 
@@ -548,7 +607,7 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     else:
         rows = con.execute(
-            "SELECT status, stake, odds FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
             (chat_id,)
         ).fetchall()
         expenses = con.execute(
@@ -562,8 +621,9 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wins = losses = 0
         total_staked = 0.0
         for r in rows:
-            total_staked += r["stake"]
-            pnl = bet_pnl(r["stake"], r["odds"], r["status"])
+            trio_s = r["stake"] - (r["annexe_stake"] or 0)
+            total_staked += trio_s
+            pnl = bet_pnl(trio_s, r["odds"], r["status"])
             total_pnl += pnl / NB_PARTS
             if r["status"] == "won":
                 wins += 1
@@ -616,7 +676,9 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["HISTORIQUE (15 derniers)\n"]
     for r in rows:
         icon = icons.get(r["status"], "?")
-        pnl = bet_pnl(r["stake"], r["odds"], r["status"])
+        a_s = (r["annexe_stake"] or 0) if not duo else 0
+        trio_s = r["stake"] - a_s
+        pnl = bet_pnl(trio_s if not duo else r["stake"], r["odds"], r["status"])
         if r["status"] == "won":
             result = fmt(pnl / NB_PARTS, chat_id) if not duo else fmt(pnl, chat_id)
         elif r["status"] == "lost":
@@ -627,9 +689,10 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = "pending"
         date_str = r["created_at"][:10] if r["created_at"] else "?"
         par = f" [{r['user_name']}]" if duo else ""
+        annexe_tag = f" [+{r['annexe_name']}]" if not duo and (r["annexe_stake"] or 0) > 0 else ""
         lines.append(
             f"{icon} #{r['id']} {date_str}{par} | {r['description']} "
-            f"@ {r['odds']:.2f} | {r['stake']:.0f} {c} | {result}"
+            f"@ {r['odds']:.2f} | {r['stake']:.0f} {c}{annexe_tag} | {result}"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -659,8 +722,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     last_status = None
 
     for r in rows:
-        total_staked += r["stake"]
-        pnl = bet_pnl(r["stake"], r["odds"], r["status"]) / divisor
+        a_s = (r["annexe_stake"] or 0) if not duo else 0
+        trio_s = r["stake"] - a_s
+        total_staked += trio_s
+        pnl = bet_pnl(trio_s, r["odds"], r["status"]) / divisor
         total_pnl += pnl
         if r["status"] == "won":
             wins += 1
@@ -842,6 +907,22 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if d[di][1] < 0.5: di += 1
             if cr[ci][1] < 0.5: ci += 1
 
+    # Show active annexe bets
+    annexe_bets = [r for r in rows if (r["annexe_stake"] or 0) > 0]
+    if annexe_bets:
+        lines.append("\nAnnexe :")
+        for r in annexe_bets:
+            a_s = r["annexe_stake"] or 0
+            a_n = r["annexe_name"] or "?"
+            bettor = r["user_name"]
+            if r["status"] == "pending":
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (pending) — avance par {bettor}")
+            elif r["status"] == "lost":
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (perdu) — {ANNEXE_HANDLER} doit {a_s:.0f} a {bettor}")
+            elif r["status"] == "won":
+                profit = a_s * (r["odds"] - 1)
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (gagne) — {bettor} doit {profit:.0f} a {ANNEXE_HANDLER}")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -864,10 +945,13 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["PARIS EN ATTENTE\n"]
     for r in rows:
         par = f" [{r['user_name']}]" if duo else ""
-        pp = "" if duo else f" ({r['stake']/NB_PARTS:.0f}/pers.)"
+        a_s = (r["annexe_stake"] or 0) if not duo else 0
+        trio_s = r["stake"] - a_s
+        pp = "" if duo else f" ({trio_s/NB_PARTS:.0f}/pers.)"
+        annexe_tag = f" [+{r['annexe_name']} {a_s:.0f}]" if a_s > 0 else ""
         lines.append(
             f"#{r['id']}{par} | {r['description']} @ {r['odds']:.2f} | "
-            f"{r['stake']:.0f} {c}{pp}"
+            f"{r['stake']:.0f} {c}{annexe_tag}{pp}"
         )
     lines.append(f"\n→ /win <id> ou /loss <id> pour marquer le resultat")
     await update.message.reply_text("\n".join(lines))
@@ -936,7 +1020,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "BET TRACKER\n\n"
             "Enregistrer un pari :\n"
             "  /lock 800 Strasbourg 1N2 3,10\n"
-            "  /lock 500 Le Mans ML 1.70\n\n"
+            "  /lock 500 Le Mans ML 1.70\n"
+            "  /lock 7000 Real ML 1,50 -Julien 1000\n"
+            "     → annexe : 1000 pour Julien, 6000 trio\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
             "  /loss (repondre au pari ou /loss <id>)\n"
@@ -1309,9 +1395,13 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.execute("UPDATE bets SET status = ?, resolved_at = ? WHERE id = ?", (status, now, bet["id"]))
     con.commit()
 
-    pnl = bet_pnl(bet["stake"], bet["odds"], status)
+    stake = bet["stake"]
+    odds = bet["odds"]
+    annexe_s = bet["annexe_stake"] or 0
+    annexe_n = bet["annexe_name"] or ""
 
     if is_duo(chat_id):
+        pnl = bet_pnl(stake, odds, status)
         if status == "won":
             result_text = f"GAGNE  {fmt(pnl, chat_id)}"
         elif status == "lost":
@@ -1325,29 +1415,41 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         reply = (
             f"Pari #{bet['id']} : {result_text}\n"
-            f"   {bet['description']} @ {bet['odds']:.2f}\n"
+            f"   {bet['description']} @ {odds:.2f}\n"
             f"   (par {bet['user_name']})\n\n"
             f"Balance : {debt_text}"
         )
     else:
+        trio_s = stake - annexe_s
+        trio_pnl = bet_pnl(trio_s, odds, status)
         if status == "won":
-            pp_result = fmt(pnl / NB_PARTS, chat_id)
-            result_text = f"GAGNE  {pp_result}/pers."
+            result_text = f"GAGNE  {fmt(trio_pnl / NB_PARTS, chat_id)}/pers."
         elif status == "lost":
-            result_text = f"PERDU  {fmt(pnl / NB_PARTS, chat_id)}/pers."
+            result_text = f"PERDU  {fmt(trio_pnl / NB_PARTS, chat_id)}/pers."
         else:
             result_text = "ANNULE"
 
         rows = con.execute(
-            "SELECT status, stake, odds FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
             (chat_id,)
         ).fetchall()
-        total_pnl = sum(bet_pnl(r["stake"], r["odds"], r["status"]) / NB_PARTS for r in rows)
+        total_pnl = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / NB_PARTS for r in rows)
         con.close()
+
+        annexe_text = ""
+        if annexe_s > 0 and status != "void":
+            c = cur(chat_id)
+            bettor = bet["user_name"]
+            if status == "won":
+                annexe_profit = annexe_s * (odds - 1)
+                annexe_text = f"\n   Annexe ({annexe_n}) : {bettor} doit {annexe_profit:.0f} {c} a {ANNEXE_HANDLER}"
+            elif status == "lost":
+                annexe_text = f"\n   Annexe ({annexe_n}) : avance de {annexe_s:.0f} {c} (inchangee)"
 
         reply = (
             f"Pari #{bet['id']} : {result_text}\n"
-            f"   {bet['description']} @ {bet['odds']:.2f}\n\n"
+            f"   {bet['description']} @ {odds:.2f}"
+            f"{annexe_text}\n\n"
             f"P&L cumule : {fmt(total_pnl, chat_id)}/pers."
         )
 
