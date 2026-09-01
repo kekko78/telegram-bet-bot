@@ -1499,6 +1499,82 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
+# ── /sync — Pousser la DB vers Google Sheets ────────────────
+async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if not SHEETS_WEBHOOK_URL:
+        await update.message.reply_text("SHEETS_WEBHOOK_URL non configure.")
+        return
+
+    duo = is_duo(chat_id)
+    sheet_tab = "Kekko-Rapha" if duo else "Paris"
+    sheet_id = SHEET_ID_DUO if duo else SHEET_ID_GROUP
+
+    con = db()
+    bets_rows = con.execute(
+        "SELECT id, description, stake, odds, user_name, status, created_at FROM bets WHERE chat_id = ? ORDER BY id",
+        (chat_id,)
+    ).fetchall()
+    tx_rows = con.execute(
+        "SELECT id, from_name, to_name, amount, description, created_at FROM transactions WHERE chat_id = ? ORDER BY id",
+        (chat_id,)
+    ).fetchall()
+    exp_rows = con.execute(
+        "SELECT id, paid_by, amount, description, created_at FROM expenses WHERE chat_id = ? ORDER BY id",
+        (chat_id,)
+    ).fetchall()
+    con.close()
+
+    bets = []
+    for r in bets_rows:
+        bets.append({
+            "id": r[0], "description": r[1], "stake": r[2], "odds": r[3],
+            "user_name": r[4], "status": r[5], "date": r[6]
+        })
+
+    transactions = []
+    for r in tx_rows:
+        transactions.append({
+            "id": r[0], "from_name": r[1], "to_name": r[2],
+            "amount": r[3], "description": r[4], "date": r[5]
+        })
+
+    expenses = []
+    for r in exp_rows:
+        expenses.append({
+            "id": r[0], "paid_by": r[1], "amount": r[2],
+            "description": r[3], "date": r[4]
+        })
+
+    payload = {
+        "action": "full_sync",
+        "sheet_id": sheet_id,
+        "sheet_tab": sheet_tab,
+        "bets": bets,
+        "transactions": transactions,
+        "expenses": expenses
+    }
+
+    await update.message.reply_text(f"Sync en cours... ({len(bets)} paris, {len(transactions)} tx, {len(expenses)} depenses)")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    await update.message.reply_text(f"Erreur Sheets: HTTP {resp.status}")
+                    return
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur: {e}")
+        return
+
+    if data.get("status") == "ok":
+        synced = data.get("synced_bets", len(bets))
+        await update.message.reply_text(f"Sync OK ! {synced} paris synchronises vers Google Sheets.")
+    else:
+        await update.message.reply_text(f"Erreur: {data}")
+
+
 # ── /restore — Re-importer les paris depuis Google Sheets ───
 async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1611,6 +1687,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("restore", cmd_restore))
+    app.add_handler(CommandHandler("sync", cmd_sync))
 
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND,
