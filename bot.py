@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import logging
+import asyncio
 import aiohttp
 from datetime import datetime, timezone
 from telegram import Update
@@ -1868,12 +1869,15 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"Erreur Sheets: HTTP {resp.status}")
                     return
                 data = await resp.json(content_type=None)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Erreur: timeout (60s). Le webhook Sheets met trop longtemps.")
+        return
     except Exception as e:
-        await update.message.reply_text(f"Erreur: {e}")
+        await update.message.reply_text(f"Erreur ({type(e).__name__}): {e}")
         return
 
     if data.get("status") != "ok":
-        await update.message.reply_text(f"Erreur: {data}")
+        await update.message.reply_text(f"Erreur Sheets: {data}")
         return
 
     synced = data.get("synced_bets", len(bets))
