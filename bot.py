@@ -301,6 +301,15 @@ def init_db():
             con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS loro_capital (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id     INTEGER NOT NULL,
+            amount      REAL NOT NULL,
+            description TEXT,
+            created_at  TEXT
+        )
+    """)
     con.commit()
     con.close()
 
@@ -837,19 +846,110 @@ async def cmd_solde_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     roi = (total_pnl_duo / total_staked * 100) if total_staked > 0 else 0
     pnl_pp = total_pnl_duo / 2
 
-    text = (
-        f"SOLDE LORO (CHF)\n\n"
-        f"Paris : {wins}W - {losses}L ({wr:.0f}%)\n"
-        f"P&L duo : {total_pnl_duo:+.0f} CHF ({pnl_pp:+.0f}/pers.)\n"
-        f"ROI : {roi:+.1f}%\n"
-        f"Mise totale : {total_staked:.0f} CHF"
+    # Capital tracking
+    con2 = db()
+    cap_rows = con2.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM loro_capital WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()
+    cap_ops = con2.execute(
+        "SELECT COUNT(*) FROM loro_capital WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()
+    con2.close()
+
+    total_deposits = cap_rows[0]
+    total_pnl_full = total_pnl_duo + total_pnl_rago  # full P&L for capital
+    pending_stakes = pending[1] if pending[0] > 0 else 0
+
+    text = f"SOLDE LORO (CHF)\n"
+
+    if total_deposits != 0 or cap_ops[0] > 0:
+        capital_now = total_deposits + total_pnl_full - pending_stakes
+        text += (
+            f"\nCapital depose : {total_deposits:.0f} CHF"
+            f"\nP&L resolu : {total_pnl_full:+.0f} CHF"
+        )
+        if pending[0] > 0:
+            text += f"\nEn jeu : {pending_stakes:.0f} CHF ({pending[0]} paris)"
+        text += f"\nDisponible : {capital_now:.0f} CHF\n"
+
+    text += (
+        f"\nParis : {wins}W - {losses}L ({wr:.0f}%)\n"
+        f"P&L duo : {total_pnl_duo:+.0f} CHF ({pnl_pp:+.0f}/pers.)"
     )
+    if pnl_pp >= 0:
+        text += f"\n  → Kekko doit {pnl_pp:.0f} CHF a Rapha"
+    else:
+        text += f"\n  → Rapha doit {-pnl_pp:.0f} CHF a Kekko"
+    text += f"\nROI : {roi:+.1f}%"
     if total_pnl_rago != 0:
         text += f"\n\nRago (sur compte Kekko) : {total_pnl_rago:+.0f} CHF"
-    if pending[0] > 0:
-        text += f"\n\nEn attente : {pending[0]} paris ({pending[1]:.0f} CHF)"
+    if pending[0] > 0 and (total_deposits == 0 and cap_ops[0] == 0):
+        text += f"\n\nEn attente : {pending[0]} paris ({pending_stakes:.0f} CHF)"
 
     await update.message.reply_text(text)
+
+
+# ── /depotLoro /retraitLoro ────────────────────────────────
+async def cmd_depot_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    parts = update.message.text.strip().split(maxsplit=2)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage : /depotLoro 2000 [description]")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Montant invalide.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("Le montant doit etre positif.")
+        return
+    desc = parts[2] if len(parts) > 2 else "depot"
+    now = datetime.now(timezone.utc).isoformat()
+    con = db()
+    con.execute(
+        "INSERT INTO loro_capital (chat_id, amount, description, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, amount, desc, now)
+    )
+    con.commit()
+    total = con.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM loro_capital WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()[0]
+    con.close()
+    await update.message.reply_text(f"Depot Loro : +{amount:.0f} CHF ({desc})\nCapital depose total : {total:.0f} CHF")
+
+
+async def cmd_retrait_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    parts = update.message.text.strip().split(maxsplit=2)
+    if len(parts) < 2:
+        await update.message.reply_text("Usage : /retraitLoro 500 [description]")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Montant invalide.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("Le montant doit etre positif.")
+        return
+    desc = parts[2] if len(parts) > 2 else "retrait"
+    now = datetime.now(timezone.utc).isoformat()
+    con = db()
+    con.execute(
+        "INSERT INTO loro_capital (chat_id, amount, description, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, -amount, desc, now)
+    )
+    con.commit()
+    total = con.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM loro_capital WHERE chat_id = ?",
+        (chat_id,)
+    ).fetchone()[0]
+    con.close()
+    await update.message.reply_text(f"Retrait Loro : -{amount:.0f} CHF ({desc})\nCapital depose total : {total:.0f} CHF")
 
 
 # ── /historique ─────────────────────────────────────────────
@@ -1220,7 +1320,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
-            "  /soldeloro — P&L des paris Loro (CHF)\n"
+            "  /soldeloro — solde + capital Loro (CHF)\n"
+            "  /depotloro 2000 — ajouter capital au kiosque\n"
+            "  /retraitloro 500 — retirer capital du kiosque\n"
             "  /delete <id> — supprimer un pari\n"
             "  /deletetx <id> — supprimer un remb/depense"
         )
@@ -1977,6 +2079,8 @@ def main():
 
     app.add_handler(CommandHandler("solde", cmd_solde))
     app.add_handler(CommandHandler("soldeloro", cmd_solde_loro))
+    app.add_handler(CommandHandler("depotloro", cmd_depot_loro))
+    app.add_handler(CommandHandler("retraitloro", cmd_retrait_loro))
     app.add_handler(CommandHandler("historique", cmd_historique))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("dettes", cmd_dettes))
