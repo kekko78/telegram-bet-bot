@@ -88,9 +88,10 @@ def bet_pnl(stake: float, odds: float, status: str) -> float:
 def get_duo_tricount(con, chat_id: int) -> dict:
     """Tricount balance for duo mode.
     Includes pending bets (avance de mise), resolved bets, shared expenses, direct transfers.
-    Returns dict with balance (positive = b owes a, alphabetical order) or None."""
+    Returns dict with balance (positive = b owes a, alphabetical order) or None.
+    Excludes Loro bets (separate CHF tracking)."""
     bets = con.execute(
-        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ?", (chat_id,)
+        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND (is_loro IS NULL OR is_loro = 0)", (chat_id,)
     ).fetchall()
     txs = con.execute(
         "SELECT from_name, to_name, amount FROM transactions WHERE chat_id = ?", (chat_id,)
@@ -294,7 +295,8 @@ def init_db():
         )
     """)
     # Add annexe columns (safe to re-run)
-    for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0")]:
+    for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0"),
+                         ("is_loro", "INTEGER DEFAULT 0")]:
         try:
             con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
@@ -313,7 +315,7 @@ async def sync_sheets(payload: dict):
         return
     # Route to correct spreadsheet based on sheet_tab
     tab = payload.get("sheet_tab", "Paris")
-    payload["sheet_id"] = SHEET_ID_DUO if tab == "Kekko-Rapha" else SHEET_ID_GROUP
+    payload["sheet_id"] = SHEET_ID_DUO if tab in ("Kekko-Rapha", "Loro") else SHEET_ID_GROUP
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -360,41 +362,50 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     chat_id = update.message.chat_id
 
-    # Optional @name override after odds (handles text @name and Telegram mention entities)
+    # Optional @name or @loro override after odds
     remainder = raw[m.end():].strip()
-    override = re.match(r'@\s*(\S+)', remainder)
-    if override:
-        bettor_name = override.group(1).strip().capitalize()
-        bettor_name = NAME_MAP.get(bettor_name, bettor_name)
-        remainder = remainder[override.end():].strip()
-    else:
-        # Check Telegram mention entities (autocomplete strips @)
-        mention_name = None
-        if update.message and update.message.entities:
-            for entity in update.message.entities:
-                if entity.type in ("mention", "text_mention"):
-                    if entity.type == "mention":
-                        text = update.message.text[entity.offset:entity.offset + entity.length]
-                        mention_name = text.lstrip("@").strip().capitalize()
-                    else:
-                        mention_name = entity.user.first_name
-                    mention_name = NAME_MAP.get(mention_name, mention_name)
-                    # Remove from remainder
-                    display = update.message.text[entity.offset:entity.offset + entity.length].lstrip("@")
-                    remainder = re.sub(r'\s*' + re.escape(display), '', remainder, flags=re.IGNORECASE).strip()
-                    break
-        if mention_name:
-            bettor_name = mention_name
-        elif not is_duo(chat_id):
-            bettor_name = GROUP_DEFAULT_BETTOR
-        else:
-            raw = user.first_name
-            bettor_name = NAME_MAP.get(raw, raw)
 
-    # Parse -NomAnnexe MONTANT (group mode only)
+    # Check for @loro (Swiss book, CHF, 50/50 Kekko-Rapha)
+    is_loro_bet = False
+    loro_match = re.search(r'@\s*loro\b', remainder, re.IGNORECASE)
+    if loro_match:
+        is_loro_bet = True
+        bettor_name = "Loro"
+        remainder = (remainder[:loro_match.start()] + remainder[loro_match.end():]).strip()
+    else:
+        override = re.match(r'@\s*(\S+)', remainder)
+        if override:
+            bettor_name = override.group(1).strip().capitalize()
+            bettor_name = NAME_MAP.get(bettor_name, bettor_name)
+            remainder = remainder[override.end():].strip()
+        else:
+            # Check Telegram mention entities (autocomplete strips @)
+            mention_name = None
+            if update.message and update.message.entities:
+                for entity in update.message.entities:
+                    if entity.type in ("mention", "text_mention"):
+                        if entity.type == "mention":
+                            text = update.message.text[entity.offset:entity.offset + entity.length]
+                            mention_name = text.lstrip("@").strip().capitalize()
+                        else:
+                            mention_name = entity.user.first_name
+                        mention_name = NAME_MAP.get(mention_name, mention_name)
+                        # Remove from remainder
+                        display = update.message.text[entity.offset:entity.offset + entity.length].lstrip("@")
+                        remainder = re.sub(r'\s*' + re.escape(display), '', remainder, flags=re.IGNORECASE).strip()
+                        break
+            if mention_name:
+                bettor_name = mention_name
+            elif not is_duo(chat_id):
+                bettor_name = GROUP_DEFAULT_BETTOR
+            else:
+                raw = user.first_name
+                bettor_name = NAME_MAP.get(raw, raw)
+
+    # Parse -NomAnnexe MONTANT (group mode + Loro)
     annexe_name = None
     annexe_stake = 0.0
-    if not is_duo(chat_id):
+    if not is_duo(chat_id) or is_loro_bet:
         annexe_match = re.search(r'-(\w+)\s+(\d+(?:[.,]\d+)?)', remainder)
         if annexe_match:
             annexe_name = annexe_match.group(1).capitalize()
@@ -407,13 +418,55 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     con = db()
     cur_ = con.execute(
-        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
-        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake)
+        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake, is_loro)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake, 1 if is_loro_bet else 0)
     )
     bet_id = cur_.lastrowid
     con.commit()
     con.close()
+
+    if is_loro_bet:
+        # Loro mode: CHF, 50/50 split (minus annexe if any)
+        loro_s = stake - annexe_stake
+        pp = loro_s / 2
+        gain_loro = loro_s * (odds - 1)
+        gain_pp = gain_loro / 2
+        if annexe_name:
+            gain_annexe = annexe_stake * (odds - 1)
+            text = (
+                f"Pari #{bet_id} enregistre [LORO]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"   Mise : {stake:.0f} CHF\n"
+                f"   ├ Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
+                f"   Gain potentiel : +{gain_pp:.0f}/pers. (+{gain_annexe:.0f} {annexe_name})\n\n"
+                f"Resultat → repondre avec /win ou /loss"
+            )
+        else:
+            text = (
+                f"Pari #{bet_id} enregistre [LORO]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   Gain potentiel : +{gain_loro:.0f} CHF (+{gain_pp:.0f}/pers.)\n\n"
+                f"Resultat → repondre avec /win ou /loss"
+            )
+        await update.message.reply_text(text)
+        sync_payload_loro = {
+            "action": "new_bet",
+            "id": bet_id,
+            "date": now[:10],
+            "description": desc,
+            "stake": stake,
+            "odds": odds,
+            "user_name": "Loro",
+            "sheet_tab": "Loro"
+        }
+        if annexe_name:
+            sync_payload_loro["annexe_name"] = annexe_name
+            sync_payload_loro["annexe_stake"] = annexe_stake
+        await sync_sheets(sync_payload_loro)
+        return
 
     c = cur(chat_id)
     if is_duo(chat_id):
@@ -546,6 +599,45 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     odds = bet["odds"]
     annexe_s = bet["annexe_stake"] or 0
     annexe_n = bet["annexe_name"] or ""
+    bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
+
+    if bet_is_loro:
+        # Loro mode: CHF, 50/50 split (minus annexe)
+        loro_s = stake - annexe_s
+        pnl_duo = bet_pnl(loro_s, odds, status)
+        pnl_pp = pnl_duo / 2
+        if status == "won":
+            result_text = f"GAGNE  +{pnl_pp:.0f}/pers."
+        elif status == "lost":
+            result_text = f"PERDU  {pnl_pp:.0f}/pers."
+        else:
+            result_text = "ANNULE"
+
+        annexe_text = ""
+        if annexe_s > 0 and status != "void":
+            pnl_annexe = bet_pnl(annexe_s, odds, status)
+            if status == "won":
+                annexe_text = f"\n   Annexe ({annexe_n}) : Kekko doit {annexe_s * (odds - 1):.0f} CHF a {annexe_n}"
+            elif status == "lost":
+                annexe_text = f"\n   Annexe ({annexe_n}) : {annexe_n} doit {annexe_s:.0f} CHF a Kekko"
+
+        # Cumul Loro P&L (excluding annexe from per-person)
+        loro_rows = con.execute(
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND is_loro = 1 AND status IN ('won','lost')",
+            (chat_id,)
+        ).fetchall()
+        total_loro = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / 2 for r in loro_rows)
+        con.close()
+
+        text = (
+            f"Pari #{bet['id']} : {result_text} [LORO]\n"
+            f"   {bet['description']} @ {odds:.2f}"
+            f"{annexe_text}\n\n"
+            f"P&L cumule Loro : {total_loro:+.0f} CHF/pers."
+        )
+        await msg.reply_text(text)
+        await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": "Loro"})
+        return
 
     if is_duo(chat_id):
         pnl = bet_pnl(stake, odds, status)
@@ -577,7 +669,7 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result_text = f"ANNULE  0 {cur(chat_id)}"
 
         rows = con.execute(
-            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost') AND (is_loro IS NULL OR is_loro = 0)",
             (chat_id,)
         ).fetchall()
         total_pnl = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / NB_PARTS for r in rows)
@@ -611,8 +703,9 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
 
+    loro_filter = " AND (is_loro IS NULL OR is_loro = 0)" if is_duo(chat_id) else ""
     pending = con.execute(
-        "SELECT COUNT(*), COALESCE(SUM(stake), 0) FROM bets WHERE chat_id = ? AND status = 'pending'",
+        f"SELECT COUNT(*), COALESCE(SUM(stake), 0) FROM bets WHERE chat_id = ? AND status = 'pending'{loro_filter}",
         (chat_id,)
     ).fetchone()
 
@@ -704,12 +797,68 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
 
+# ── /soldeloro — P&L des paris Loro (CHF) ──────────────────
+async def cmd_solde_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    con = db()
+
+    rows = con.execute(
+        "SELECT status, stake, odds, annexe_stake, annexe_name FROM bets WHERE chat_id = ? AND is_loro = 1 AND status IN ('won','lost') ORDER BY id",
+        (chat_id,)
+    ).fetchall()
+    pending = con.execute(
+        "SELECT COUNT(*), COALESCE(SUM(stake), 0) FROM bets WHERE chat_id = ? AND is_loro = 1 AND status = 'pending'",
+        (chat_id,)
+    ).fetchone()
+    con.close()
+
+    if not rows and pending[0] == 0:
+        await update.message.reply_text("Aucun pari Loro enregistre.")
+        return
+
+    wins = losses = 0
+    total_pnl_duo = 0.0
+    total_pnl_rago = 0.0
+    total_staked = 0.0
+    for r in rows:
+        a_s = r["annexe_stake"] or 0
+        duo_s = r["stake"] - a_s
+        total_pnl_duo += bet_pnl(duo_s, r["odds"], r["status"])
+        if a_s > 0:
+            total_pnl_rago += bet_pnl(a_s, r["odds"], r["status"])
+        total_staked += r["stake"]
+        if r["status"] == "won":
+            wins += 1
+        else:
+            losses += 1
+
+    total = wins + losses
+    wr = (wins / total * 100) if total > 0 else 0
+    roi = (total_pnl_duo / total_staked * 100) if total_staked > 0 else 0
+    pnl_pp = total_pnl_duo / 2
+
+    text = (
+        f"SOLDE LORO (CHF)\n\n"
+        f"Paris : {wins}W - {losses}L ({wr:.0f}%)\n"
+        f"P&L duo : {total_pnl_duo:+.0f} CHF ({pnl_pp:+.0f}/pers.)\n"
+        f"ROI : {roi:+.1f}%\n"
+        f"Mise totale : {total_staked:.0f} CHF"
+    )
+    if total_pnl_rago != 0:
+        text += f"\n\nRago (sur compte Kekko) : {total_pnl_rago:+.0f} CHF"
+    if pending[0] > 0:
+        text += f"\n\nEn attente : {pending[0]} paris ({pending[1]:.0f} CHF)"
+
+    await update.message.reply_text(text)
+
+
 # ── /historique ─────────────────────────────────────────────
 async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
+    loro_filter = " AND (is_loro IS NULL OR is_loro = 0)" if is_duo(chat_id) else ""
     rows = con.execute(
-        "SELECT * FROM bets WHERE chat_id = ? ORDER BY id DESC LIMIT 15",
+        f"SELECT * FROM bets WHERE chat_id = ?{loro_filter} ORDER BY id DESC LIMIT 15",
         (chat_id,)
     ).fetchall()
     con.close()
@@ -749,8 +898,9 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
+    loro_filter = " AND (is_loro IS NULL OR is_loro = 0)" if is_duo(chat_id) else ""
     rows = con.execute(
-        "SELECT * FROM bets WHERE chat_id = ? AND status IN ('won','lost') ORDER BY id",
+        f"SELECT * FROM bets WHERE chat_id = ? AND status IN ('won','lost'){loro_filter} ORDER BY id",
         (chat_id,)
     ).fetchall()
     con.close()
@@ -978,8 +1128,9 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
+    loro_filter = " AND (is_loro IS NULL OR is_loro = 0)" if is_duo(chat_id) else ""
     rows = con.execute(
-        "SELECT * FROM bets WHERE chat_id = ? AND status = 'pending' ORDER BY id",
+        f"SELECT * FROM bets WHERE chat_id = ? AND status = 'pending'{loro_filter} ORDER BY id",
         (chat_id,)
     ).fetchall()
     con.close()
@@ -1026,12 +1177,19 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         con.close()
         await update.message.reply_text(f"Pari #{bet_id} introuvable.")
         return
+    bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
     con.execute("DELETE FROM bets WHERE id = ?", (bet_id,))
     con.commit()
     con.close()
-    await update.message.reply_text(f"Pari #{bet_id} supprime ({bet['description']}).")
+    tag = " [LORO]" if bet_is_loro else ""
+    await update.message.reply_text(f"Pari #{bet_id} supprime ({bet['description']}){tag}.")
 
-    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
+    if bet_is_loro:
+        sheet_tab = "Loro"
+    elif is_duo(chat_id):
+        sheet_tab = "Kekko-Rapha"
+    else:
+        sheet_tab = "Paris"
     await sync_sheets({"action": "delete_bet", "id": bet_id, "sheet_tab": sheet_tab})
 
 
@@ -1046,6 +1204,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "BET TRACKER (mode duo)\n\n"
             "Enregistrer un pari :\n"
             f"  /lock 800 Strasbourg 1N2 3,10\n"
+            f"  /lock 500 Basel ML 2,10 @loro — pari Loro (CHF)\n"
+            f"  /lock 500 Basel ML 2,10 -Rago 100 @loro — Loro + annexe\n"
             f"  → enregistre 800 {c} par toi pour l'autre\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
@@ -1060,6 +1220,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
+            "  /soldeloro — P&L des paris Loro (CHF)\n"
             "  /delete <id> — supprimer un pari\n"
             "  /deletetx <id> — supprimer un remb/depense"
         )
@@ -1439,6 +1600,41 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     odds = bet["odds"]
     annexe_s = bet["annexe_stake"] or 0
     annexe_n = bet["annexe_name"] or ""
+    bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
+
+    if bet_is_loro:
+        loro_s = stake - annexe_s
+        pnl_duo = bet_pnl(loro_s, odds, status)
+        pnl_pp = pnl_duo / 2
+        if status == "won":
+            result_text = f"GAGNE  +{pnl_pp:.0f}/pers."
+        elif status == "lost":
+            result_text = f"PERDU  {pnl_pp:.0f}/pers."
+        else:
+            result_text = "ANNULE"
+
+        annexe_text = ""
+        if annexe_s > 0 and status != "void":
+            if status == "won":
+                annexe_text = f"\n   Annexe ({annexe_n}) : Kekko doit {annexe_s * (odds - 1):.0f} CHF a {annexe_n}"
+            elif status == "lost":
+                annexe_text = f"\n   Annexe ({annexe_n}) : {annexe_n} doit {annexe_s:.0f} CHF a Kekko"
+
+        loro_rows = con.execute(
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND is_loro = 1 AND status IN ('won','lost')",
+            (chat_id,)
+        ).fetchall()
+        total_loro = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / 2 for r in loro_rows)
+        con.close()
+        reply = (
+            f"Pari #{bet['id']} : {result_text} [LORO]\n"
+            f"   {bet['description']} @ {odds:.2f}"
+            f"{annexe_text}\n\n"
+            f"P&L cumule Loro : {total_loro:+.0f} CHF/pers."
+        )
+        await msg.reply_text(reply)
+        await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": "Loro"})
+        return
 
     if is_duo(chat_id):
         pnl = bet_pnl(stake, odds, status)
@@ -1470,7 +1666,7 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result_text = "ANNULE"
 
         rows = con.execute(
-            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost')",
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost') AND (is_loro IS NULL OR is_loro = 0)",
             (chat_id,)
         ).fetchall()
         total_pnl = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / NB_PARTS for r in rows)
@@ -1512,7 +1708,7 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     con = db()
     bets_rows = con.execute(
-        "SELECT id, description, stake, odds, user_name, status, created_at FROM bets WHERE chat_id = ? ORDER BY id",
+        "SELECT id, description, stake, odds, user_name, status, created_at, is_loro FROM bets WHERE chat_id = ? ORDER BY id",
         (chat_id,)
     ).fetchall()
     tx_rows = con.execute(
@@ -1526,11 +1722,16 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.close()
 
     bets = []
+    loro_bets = []
     for r in bets_rows:
-        bets.append({
+        entry = {
             "id": r[0], "description": r[1], "stake": r[2], "odds": r[3],
             "user_name": r[4], "status": r[5], "date": r[6]
-        })
+        }
+        if r[7]:  # is_loro
+            loro_bets.append(entry)
+        else:
+            bets.append(entry)
 
     transactions = []
     for r in tx_rows:
@@ -1555,7 +1756,8 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "expenses": expenses
     }
 
-    await update.message.reply_text(f"Sync en cours... ({len(bets)} paris, {len(transactions)} tx, {len(expenses)} depenses)")
+    loro_info = f" + {len(loro_bets)} Loro" if loro_bets else ""
+    await update.message.reply_text(f"Sync en cours... ({len(bets)} paris{loro_info}, {len(transactions)} tx, {len(expenses)} depenses)")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1568,11 +1770,34 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Erreur: {e}")
         return
 
-    if data.get("status") == "ok":
-        synced = data.get("synced_bets", len(bets))
-        await update.message.reply_text(f"Sync OK ! {synced} paris synchronises vers Google Sheets.")
-    else:
+    if data.get("status") != "ok":
         await update.message.reply_text(f"Erreur: {data}")
+        return
+
+    synced = data.get("synced_bets", len(bets))
+    msg_text = f"Sync OK ! {synced} paris synchronises."
+
+    # Sync Loro bets separately
+    if loro_bets:
+        loro_payload = {
+            "action": "full_sync",
+            "sheet_id": SHEET_ID_DUO,
+            "sheet_tab": "Loro",
+            "bets": loro_bets,
+            "transactions": [],
+            "expenses": []
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(SHEETS_WEBHOOK_URL, json=loro_payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        msg_text += f" + {len(loro_bets)} Loro."
+                    else:
+                        msg_text += f" (Loro sync erreur: HTTP {resp.status})"
+        except Exception as e:
+            msg_text += f" (Loro sync erreur: {e})"
+
+    await update.message.reply_text(msg_text)
 
 
 # ── /restore — Re-importer les paris depuis Google Sheets ───
@@ -1751,6 +1976,7 @@ def main():
         app.add_handler(CommandHandler(cmd, cmd_result))
 
     app.add_handler(CommandHandler("solde", cmd_solde))
+    app.add_handler(CommandHandler("soldeloro", cmd_solde_loro))
     app.add_handler(CommandHandler("historique", cmd_historique))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("dettes", cmd_dettes))
@@ -1776,6 +2002,7 @@ def main():
         await application.bot.set_my_commands([
             ("lock", "Enregistrer un pari"),
             ("solde", "Voir le solde P&L"),
+            ("soldeloro", "P&L paris Loro (CHF)"),
             ("dettes", "Voir qui doit quoi"),
             ("pending", "Paris en cours"),
             ("historique", "Derniers paris resolus"),
