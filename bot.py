@@ -1864,13 +1864,13 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=180)) as resp:
                 if resp.status != 200:
                     await update.message.reply_text(f"Erreur Sheets: HTTP {resp.status}")
                     return
                 data = await resp.json(content_type=None)
     except asyncio.TimeoutError:
-        await update.message.reply_text("Erreur: timeout (60s). Le webhook Sheets met trop longtemps.")
+        await update.message.reply_text("Erreur: timeout (180s). Le webhook Sheets met trop longtemps.")
         return
     except Exception as e:
         await update.message.reply_text(f"Erreur ({type(e).__name__}): {e}")
