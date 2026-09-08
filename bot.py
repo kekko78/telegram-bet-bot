@@ -14,7 +14,7 @@ import sqlite3
 import logging
 import asyncio
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -87,9 +87,10 @@ def bet_pnl(stake: float, odds: float, status: str) -> float:
     return 0.0
 
 def get_duo_tricount(con, chat_id: int) -> dict:
-    """Tricount balance for duo mode.
+    """Tricount balance for duo/multi mode.
     Includes pending bets (avance de mise), resolved bets, shared expenses, direct transfers.
-    Returns dict with balance (positive = b owes a, alphabetical order) or None.
+    Supports N users (real Tricount style: each person's fair share = total / N).
+    Returns dict with per-user balances or None.
     Excludes Loro bets (separate CHF tracking)."""
     bets = con.execute(
         "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND (is_loro IS NULL OR is_loro = 0)", (chat_id,)
@@ -102,7 +103,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
     ).fetchall()
 
     users = set()
-    contribution = {}   # net amount each user contributed for the duo
+    contribution = {}   # net amount each user contributed for the group
     pending_stakes = {}
     pending_count = {}
     pnl = {}
@@ -143,39 +144,61 @@ def get_duo_tricount(con, chat_id: int) -> dict:
     if len(users) < 2:
         return None
 
-    a, b = users[0], users[1]
+    # N-way fair split: each person's fair share = total contributions / N
+    n = len(users)
+    total_contribution = sum(contribution.get(u, 0) for u in users)
+    fair_share = total_contribution / n
 
-    # Contribution balance: direct debt (no splitting for duo mode)
-    contrib_bal = contribution.get(a, 0) - contribution.get(b, 0)
+    # Per-user balance: positive = others owe them, negative = they owe others
+    balances = {}
+    for u in users:
+        balances[u] = contribution.get(u, 0) - fair_share
 
-    # Direct transfers offset the debt
-    net_b_to_a = 0.0
+    # Apply direct transfers to balances
     for t in txs:
-        if t["from_name"] == b and t["to_name"] == a:
-            net_b_to_a += t["amount"]
-        elif t["from_name"] == a and t["to_name"] == b:
-            net_b_to_a -= t["amount"]
+        balances[t["from_name"]] = balances.get(t["from_name"], 0) + t["amount"]
+        balances[t["to_name"]] = balances.get(t["to_name"], 0) - t["amount"]
 
-    balance = contrib_bal - net_b_to_a
+    # Backward compat: keep "a" and "b" as first two users
+    a = users[0]
+    b = users[1] if len(users) > 1 else users[0]
 
     return {
-        "balance": balance, "a": a, "b": b,
+        "balances": balances, "users": users, "a": a, "b": b,
         "contribution": contribution, "pending_stakes": pending_stakes,
         "pending_count": pending_count, "pnl": pnl, "wins": wins, "losses": losses,
-        "expense_total": expense_total, "net_b_to_a": net_b_to_a,
+        "expense_total": expense_total,
     }
 
 
 def format_tricount_balance(tc: dict, chat_id: int) -> str:
     if not tc:
         return "Pas encore de donnees"
-    bal = tc["balance"]
-    a, b, c = tc["a"], tc["b"], cur(chat_id)
-    if bal > 0.5:
-        return f"{b} doit {bal:.0f} {c} a {a}"
-    elif bal < -0.5:
-        return f"{a} doit {abs(bal):.0f} {c} a {b}"
-    return "Vous etes a jour !"
+    balances = tc["balances"]
+    c = cur(chat_id)
+
+    # Compute minimal settlement transfers (greedy algorithm)
+    debtors = sorted([(n, -b) for n, b in balances.items() if b < -0.5], key=lambda x: -x[1])
+    creditors = sorted([(n, b) for n, b in balances.items() if b > 0.5], key=lambda x: -x[1])
+
+    if not debtors and not creditors:
+        return "Vous etes a jour !"
+
+    transfers = []
+    di = ci = 0
+    d = [list(x) for x in debtors]
+    cr = [list(x) for x in creditors]
+    while di < len(d) and ci < len(cr):
+        transfer = min(d[di][1], cr[ci][1])
+        transfers.append(f"{d[di][0]} doit {transfer:.0f} {c} a {cr[ci][0]}")
+        d[di][1] -= transfer
+        cr[ci][1] -= transfer
+        if d[di][1] < 0.5:
+            di += 1
+        if cr[ci][1] < 0.5:
+            ci += 1
+
+    return " | ".join(transfers) if transfers else "Vous etes a jour !"
 
 
 def get_group_tricount(con, chat_id: int) -> dict:
@@ -297,7 +320,7 @@ def init_db():
     """)
     # Add annexe columns (safe to re-run)
     for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0"),
-                         ("is_loro", "INTEGER DEFAULT 0")]:
+                         ("is_loro", "INTEGER DEFAULT 0"), ("event_date", "TEXT")]:
         try:
             con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
@@ -332,6 +355,85 @@ async def sync_sheets(payload: dict):
                 log.info(f"Sheets sync: {payload.get('action')} → {resp.status}")
     except Exception as e:
         log.warning(f"Sheets sync failed: {e}")
+
+# ── Event date lookup ──────────────────────────────────────────
+_BET_NOISE = re.compile(
+    r'\b(?:ML|1N2|DNB|DC|BTTS|over|under|plus|moins|tirs|3pts?|pts?|buts?|corners?|'
+    r'cartons?|mi-temps|mt|handicap|hc|combo|exact|score|CdB|CdC)\b'
+    r'|\b[ou]\d+[.,]?\d*\b'
+    r'|@\s*\S+',
+    re.IGNORECASE
+)
+_MONTHS = {
+    "janvier":1,"février":2,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,
+    "juillet":7,"août":8,"aout":8,"septembre":9,"octobre":10,"novembre":11,
+    "décembre":12,"decembre":12,"janv":1,"févr":2,"fevr":2,"avr":4,
+    "juil":7,"sept":9,"oct":10,"nov":11,"déc":12,"dec":12,
+    "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,"july":7,
+    "august":8,"september":9,"october":10,"november":11,"december":12,
+    "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,"sep":9,
+}
+
+def _clean_desc(desc):
+    c = _BET_NOISE.sub(' ', desc)
+    c = re.sub(r'\d+[.,]\d+', ' ', c)
+    return re.sub(r'\s+', ' ', c).strip()
+
+def _extract_date(text):
+    today = datetime.now(timezone.utc)
+    candidates = []
+    for m in re.finditer(r'(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})', text):
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31 and 2024 <= y <= 2030:
+            candidates.append(f"{y}-{mo:02d}-{d:02d}")
+    for m in re.finditer(r'(20\d{2})-(\d{2})-(\d{2})', text):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            candidates.append(f"{y}-{mo:02d}-{d:02d}")
+    months_pat = '|'.join(_MONTHS.keys())
+    for m in re.finditer(rf'(\d{{1,2}})\s*(?:er)?\s*({months_pat})\.?\s*(\d{{4}})?', text, re.IGNORECASE):
+        d = int(m.group(1))
+        mo = _MONTHS.get(m.group(2).lower().rstrip('.'))
+        y = int(m.group(3)) if m.group(3) else today.year
+        if mo and 1 <= d <= 31:
+            try:
+                if not m.group(3) and datetime(y, mo, d, tzinfo=timezone.utc) < today - timedelta(days=7):
+                    y += 1
+                candidates.append(f"{y}-{mo:02d}-{d:02d}")
+            except ValueError:
+                pass
+    best, best_diff = None, None
+    for c in candidates:
+        try:
+            dt = datetime.fromisoformat(c + "T00:00:00+00:00")
+            diff = (dt - today).days
+            if -7 <= diff <= 90:
+                if best_diff is None or (0 <= diff < best_diff) or (best_diff < 0 and diff >= 0) or (best_diff < 0 and diff > best_diff):
+                    best, best_diff = c, diff
+        except ValueError:
+            pass
+    return best
+
+async def find_event_date(desc):
+    query = _clean_desc(desc)
+    if len(query) < 3:
+        return None
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": f"{query} prochain match date"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+        text = re.sub(r'<[^>]+>', ' ', html)
+        return _extract_date(text)
+    except Exception as e:
+        log.info(f"Event date lookup failed: {e}")
+        return None
+
 
 # ── /lock — Enregistrer un pari ─────────────────────────────
 LOCK_PATTERN = re.compile(
@@ -426,15 +528,23 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.now(timezone.utc).isoformat()
 
+    # Try to find the sporting event date
+    event_date = await find_event_date(desc)
+
     con = db()
     cur_ = con.execute(
-        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake, is_loro)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
-        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake, 1 if is_loro_bet else 0)
+        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake, is_loro, event_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake, 1 if is_loro_bet else 0, event_date)
     )
     bet_id = cur_.lastrowid
     con.commit()
     con.close()
+
+    date_line = ""
+    if event_date:
+        dp = event_date.split('-')
+        date_line = f"   Date evenement : {dp[2]}/{dp[1]}/{dp[0]}\n"
 
     if is_loro_bet:
         # Loro mode: CHF, 50/50 split (minus annexe if any)
@@ -447,6 +557,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text = (
                 f"Pari #{bet_id} enregistre [LORO]\n"
                 f"   {desc} @ {odds:.2f}\n"
+                f"{date_line}"
                 f"   Mise : {stake:.0f} CHF\n"
                 f"   ├ Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
                 f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
@@ -457,6 +568,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text = (
                 f"Pari #{bet_id} enregistre [LORO]\n"
                 f"   {desc} @ {odds:.2f}\n"
+                f"{date_line}"
                 f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
                 f"   Gain potentiel : +{gain_loro:.0f} CHF (+{gain_pp:.0f}/pers.)\n\n"
                 f"Resultat → repondre avec /win ou /loss"
@@ -475,6 +587,8 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if annexe_name:
             sync_payload_loro["annexe_name"] = annexe_name
             sync_payload_loro["annexe_stake"] = annexe_stake
+        if event_date:
+            sync_payload_loro["event_date"] = event_date
         await sync_sheets(sync_payload_loro)
         return
 
@@ -488,6 +602,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = (
             f"Pari #{bet_id} enregistre\n"
             f"   {desc} @ {odds:.2f}\n"
+            f"{date_line}"
             f"   Mise : {stake:.0f} {c} (par {bettor_name})\n"
             f"   Gain potentiel : {fmt(gain, chat_id)}\n\n"
             f"Balance : {balance_text}\n"
@@ -500,6 +615,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = (
             f"Pari #{bet_id} enregistre\n"
             f"   {desc} @ {odds:.2f}\n"
+            f"{date_line}"
             f"   Mise : {stake:.0f} {c}\n"
             f"   ├ Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
             f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
@@ -513,6 +629,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = (
             f"Pari #{bet_id} enregistre\n"
             f"   {desc} @ {odds:.2f}\n"
+            f"{date_line}"
             f"   Mise : {stake:.0f} {c} ({pp:.0f}/pers.)\n"
             f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
             f"Resultat → repondre a ce message avec /win ou /loss"
@@ -533,6 +650,8 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if annexe_name:
         sync_payload["annexe_name"] = annexe_name
         sync_payload["annexe_stake"] = annexe_stake
+    if event_date:
+        sync_payload["event_date"] = event_date
     await sync_sheets(sync_payload)
 
 
@@ -729,17 +848,14 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         balance_text = format_tricount_balance(tc, chat_id)
         c = cur(chat_id)
-        a, b = tc["a"], tc["b"]
         total_wins = sum(tc["wins"].values())
         total_losses = sum(tc["losses"].values())
         total_pnl = sum(tc["pnl"].values())
-        total_staked = sum(s for u, s in tc["pnl"].items() for _ in [0])  # recalc below
-        # recompute total staked from resolved bets
         total_resolved = total_wins + total_losses
         wr = (total_wins / total_resolved * 100) if total_resolved > 0 else 0
 
         lines = [f"SOLDE DUO\n\nBalance : {balance_text}\n"]
-        for u in [a, b]:
+        for u in tc["users"]:
             w = tc["wins"].get(u, 0)
             lo = tc["losses"].get(u, 0)
             p = tc["pending_count"].get(u, 0)
@@ -1082,12 +1198,11 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         balance_text = format_tricount_balance(tc, chat_id)
         c = cur(chat_id)
-        a, b = tc["a"], tc["b"]
 
         lines = [f"TRICOUNT\n\n{balance_text}\n"]
 
         lines.append("--- Paris ---")
-        for u in [a, b]:
+        for u in tc["users"]:
             w = tc["wins"].get(u, 0)
             lo = tc["losses"].get(u, 0)
             p = tc["pending_count"].get(u, 0)
@@ -1103,7 +1218,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if tc["expense_total"]:
             lines.append("\n--- Depenses ---")
-            for u in [a, b]:
+            for u in tc["users"]:
                 if u in tc["expense_total"]:
                     lines.append(f"  {u} a paye : {tc['expense_total'][u]:.0f} {c}")
 
@@ -1115,6 +1230,25 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines.append("\n--- Transferts ---")
             for tx in tx_list[:5]:
                 lines.append(f"  {tx['from_name']}→{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
+
+        # Settlement suggestions
+        balances = tc["balances"]
+        debtors = sorted([(n, -bal) for n, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
+        creditors = sorted([(n, bal) for n, bal in balances.items() if bal > 0.5], key=lambda x: -x[1])
+        if debtors and creditors:
+            lines.append("\nReglements :")
+            di = ci = 0
+            d = [list(x) for x in debtors]
+            cr = [list(x) for x in creditors]
+            while di < len(d) and ci < len(cr):
+                transfer = min(d[di][1], cr[ci][1])
+                lines.append(f"  {d[di][0]} → {cr[ci][0]} : {transfer:.0f} {c}")
+                d[di][1] -= transfer
+                cr[ci][1] -= transfer
+                if d[di][1] < 0.5:
+                    di += 1
+                if cr[ci][1] < 0.5:
+                    ci += 1
 
         await update.message.reply_text("\n".join(lines))
         return
@@ -1294,6 +1428,71 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "delete_bet", "id": bet_id, "sheet_tab": sheet_tab})
 
 
+# ── /date — Override event date ────────────────────────────────
+async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text("Format : /date #ID JJ/MM ou AAAA-MM-JJ\nEx: /date #42 05/09")
+        return
+
+    id_str = ctx.args[0].lstrip('#')
+    try:
+        bet_id = int(id_str)
+    except ValueError:
+        await update.message.reply_text("ID invalide. Ex: /date #42 05/09")
+        return
+
+    date_str = ctx.args[1]
+    event_date = None
+
+    m = re.match(r'^(\d{1,2})/(\d{1,2})$', date_str)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        y = datetime.now().year
+        if 1 <= d <= 31 and 1 <= mo <= 12:
+            try:
+                if datetime(y, mo, d).date() < datetime.now().date() - timedelta(days=7):
+                    y += 1
+                event_date = f"{y}-{mo:02d}-{d:02d}"
+            except ValueError:
+                pass
+
+    if not event_date:
+        m = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', date_str)
+        if m:
+            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                event_date = f"{y}-{mo:02d}-{d:02d}"
+
+    if not event_date:
+        m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})$', date_str)
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                event_date = f"{y}-{mo:02d}-{d:02d}"
+
+    if not event_date:
+        await update.message.reply_text("Date pas reconnue. Formats : JJ/MM, JJ/MM/AAAA, AAAA-MM-JJ")
+        return
+
+    chat_id = update.message.chat_id
+    con = db()
+    row = con.execute("SELECT id, description FROM bets WHERE id = ? AND chat_id = ?", (bet_id, chat_id)).fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text(f"Pari #{bet_id} introuvable.")
+        return
+
+    con.execute("UPDATE bets SET event_date = ? WHERE id = ?", (event_date, bet_id))
+    con.commit()
+    con.close()
+
+    dp = event_date.split('-')
+    await update.message.reply_text(f"Pari #{bet_id} : date evenement → {dp[2]}/{dp[1]}/{dp[0]}")
+
+    sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
+    await sync_sheets({"action": "update_date", "id": bet_id, "event_date": event_date, "sheet_tab": sheet_tab})
+
+
 # ── /help ───────────────────────────────────────────────────
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -1324,6 +1523,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /soldeloro — solde + capital Loro (CHF)\n"
             "  /depotloro 2000 — ajouter capital au kiosque\n"
             "  /retraitloro 500 — retirer capital du kiosque\n"
+            "  /date #ID JJ/MM — changer la date evenement\n"
             "  /delete <id> — supprimer un pari\n"
             "  /deletetx <id> — supprimer un remb/depense"
         )
@@ -1349,6 +1549,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /pending — paris en attente\n"
             "  /historique — 15 derniers paris\n"
             "  /stats — stats detaillees\n"
+            "  /date #ID JJ/MM — changer la date evenement\n"
             "  /delete <id> — supprimer un pari\n"
             "  /deletetx <id> — supprimer un remb/depense"
         )
@@ -1497,7 +1698,6 @@ async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     duo = is_duo(chat_id)
-    parts = 2 if duo else NB_PARTS
 
     if not ctx.args:
         await update.message.reply_text(
@@ -1554,9 +1754,11 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if duo:
         tc = get_duo_tricount(con, chat_id)
         balance_text = format_tricount_balance(tc, chat_id)
+        parts = len(tc["users"]) if tc else 2
     else:
         balances = get_group_tricount(con, chat_id)
         balance_text = format_group_tricount(balances, chat_id)
+        parts = NB_PARTS
     con.close()
 
     text = (
@@ -1583,7 +1785,6 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     duo = is_duo(chat_id)
-    parts = 2 if duo else NB_PARTS
 
     if not ctx.args:
         await update.message.reply_text(
@@ -1629,9 +1830,11 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if duo:
         tc = get_duo_tricount(con, chat_id)
         balance_text = format_tricount_balance(tc, chat_id)
+        parts = len(tc["users"]) if tc else 2
     else:
         balances = get_group_tricount(con, chat_id)
         balance_text = format_group_tricount(balances, chat_id)
+        parts = NB_PARTS
     con.close()
 
     text = (
@@ -1811,7 +2014,7 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     con = db()
     bets_rows = con.execute(
-        "SELECT id, description, stake, odds, user_name, status, created_at, is_loro FROM bets WHERE chat_id = ? ORDER BY id",
+        "SELECT id, description, stake, odds, user_name, status, created_at, is_loro, event_date FROM bets WHERE chat_id = ? ORDER BY id",
         (chat_id,)
     ).fetchall()
     tx_rows = con.execute(
@@ -1829,7 +2032,8 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for r in bets_rows:
         entry = {
             "id": r[0], "description": r[1], "stake": r[2], "odds": r[3],
-            "user_name": r[4], "status": r[5], "date": r[6]
+            "user_name": r[4], "status": r[5], "date": r[6],
+            "event_date": r[8],
         }
         if r[7]:  # is_loro
             loro_bets.append(entry)
@@ -2014,6 +2218,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("dettes", cmd_dettes))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("date", cmd_date))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("deletetx", cmd_deletetx))
     app.add_handler(CommandHandler("remb", cmd_remb))
@@ -2029,6 +2234,14 @@ def main():
         on_reply_result
     ))
 
+    async def error_handler(update, context):
+        log.error(f"Exception: {context.error}", exc_info=context.error)
+        if update and update.message:
+            try:
+                await update.message.reply_text(f"Erreur: {context.error}")
+            except Exception:
+                pass
+    app.add_error_handler(error_handler)
 
     async def post_init(application):
         await application.bot.set_my_commands([
@@ -2042,6 +2255,7 @@ def main():
             ("depense", "Depense partagee"),
             ("retrait", "Retrait partage"),
             ("remb", "Remboursement / transfert"),
+            ("date", "Modifier la date evenement"),
             ("delete", "Supprimer un pari"),
             ("deletetx", "Supprimer un remb/depense"),
             ("sync", "Resync DB vers Google Sheets"),
