@@ -32,6 +32,7 @@ SHEET_ID_DUO   = "1oLodmWlhKfoSdcmgWeR42bcrCh_7YJUBJ9jMMps5EgU"
 GROUP_DEFAULT_BETTOR = "Marco"
 ANNEXE_HANDLER = "Kekko"  # Alex handles annexe payments/recoveries
 NAME_MAP = {"Twix": "Kekko"}
+DUO_PARTICIPANTS = {"Kekko", "Rapha"}  # Only these 2 share the tricount
 
 def parse_name_override(raw: str, update) -> tuple:
     """Parse @name from text OR Telegram mention entities.
@@ -513,6 +514,14 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 raw = user.first_name
                 bettor_name = NAME_MAP.get(raw, raw)
+
+    # In duo mode, only DUO_PARTICIPANTS can enter bets without @mention
+    if is_duo(chat_id) and not is_loro_bet and bettor_name not in DUO_PARTICIPANTS:
+        await update.message.reply_text(
+            f"Nom inconnu « {bettor_name} ». "
+            f"Utilise @Kekko ou @Rapha pour attribuer le pari."
+        )
+        return
 
     # Parse -NomAnnexe MONTANT (group mode + Loro)
     annexe_name = None
@@ -1740,6 +1749,13 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Montant invalide.")
         return
 
+    # In duo mode, only DUO_PARTICIPANTS can be attributed without @mention
+    if duo and paid_by not in DUO_PARTICIPANTS:
+        await update.message.reply_text(
+            f"Nom inconnu « {paid_by} ». Utilise @Kekko ou @Rapha pour attribuer la depense."
+        )
+        return
+
     now = datetime.now(timezone.utc).isoformat()
     c = cur(chat_id)
 
@@ -1813,6 +1829,13 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if amount <= 0:
         await update.message.reply_text("Montant invalide.")
+        return
+
+    # In duo mode, only DUO_PARTICIPANTS can be attributed without @mention
+    if duo and received_by not in DUO_PARTICIPANTS:
+        await update.message.reply_text(
+            f"Nom inconnu « {received_by} ». Utilise @Kekko ou @Rapha pour attribuer le retrait."
+        )
         return
 
     now = datetime.now(timezone.utc).isoformat()
