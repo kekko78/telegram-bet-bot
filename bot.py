@@ -115,7 +115,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
         u = b["user_name"].strip().capitalize()
         users.add(u)
         S, O, st = b["stake"], b["odds"], b["status"]
-        if st == "void":
+        if st in ("void", "waiting"):
             continue
         if st == "pending":
             contribution[u] = contribution.get(u, 0) + S
@@ -206,7 +206,7 @@ def get_group_tricount(con, chat_id: int) -> dict:
     """Tricount balance for group mode (3-way split).
     Returns {name: balance} where positive = group owes you."""
     bets = con.execute(
-        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND status != 'void'",
+        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND status NOT IN ('void', 'waiting')",
         (chat_id,)
     ).fetchall()
     txs = con.execute(
@@ -446,6 +446,12 @@ LOCK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+WAIT_PATTERN = re.compile(
+    r"(.+)\s+"                 # groupe 1 : description (greedy → last number = cote)
+    r"(\d+[.,]\d+)",           # groupe 2 : cote
+    re.IGNORECASE
+)
+
 async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         c = cur(update.message.chat_id)
@@ -664,6 +670,365 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets(sync_payload)
 
 
+# ── /wait — Pré-enregistrer un pari sans mise ────────────────
+async def cmd_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "Format : /wait <description> <cote> [@nom]\n"
+            "Ex: /wait PSG vainqueur 1,80\n"
+            "Ex: /wait Basel ML 2,10 @Rapha\n"
+            "→ Pre-enregistre sans mise. /confirm <id> <mise> pour valider."
+        )
+        return
+
+    raw = " ".join(ctx.args)
+    m = WAIT_PATTERN.search(raw)
+    if not m:
+        await update.message.reply_text("Format pas reconnu.\nEx: /wait PSG vainqueur 1,80")
+        return
+
+    desc = m.group(1).strip()
+    desc = re.sub(r'\s*@\s*$', '', desc)
+    odds = float(m.group(2).replace(",", "."))
+
+    if odds < 1.01:
+        await update.message.reply_text("Cote invalide.")
+        return
+
+    user = update.message.from_user
+    chat_id = update.message.chat_id
+
+    remainder = raw[m.end():].strip()
+
+    is_loro_bet = False
+    loro_match = re.search(r'@\s*loro\b', remainder, re.IGNORECASE)
+    if loro_match:
+        is_loro_bet = True
+        bettor_name = "Loro"
+        remainder = (remainder[:loro_match.start()] + remainder[loro_match.end():]).strip()
+    else:
+        override = re.match(r'@\s*(\S+)', remainder)
+        if override:
+            bettor_name = override.group(1).strip().capitalize()
+            bettor_name = NAME_MAP.get(bettor_name, bettor_name)
+        else:
+            mention_name = None
+            if update.message and update.message.entities:
+                for entity in update.message.entities:
+                    if entity.type in ("mention", "text_mention"):
+                        if entity.type == "mention":
+                            text = update.message.text[entity.offset:entity.offset + entity.length]
+                            mention_name = text.lstrip("@").strip().capitalize()
+                        else:
+                            mention_name = entity.user.first_name
+                        mention_name = NAME_MAP.get(mention_name, mention_name)
+                        break
+            if mention_name:
+                bettor_name = mention_name
+            elif not is_duo(chat_id):
+                bettor_name = GROUP_DEFAULT_BETTOR
+            else:
+                raw_name = user.first_name
+                bettor_name = NAME_MAP.get(raw_name, raw_name)
+
+    if is_duo(chat_id) and not is_loro_bet and bettor_name not in DUO_PARTICIPANTS:
+        await update.message.reply_text(
+            f"Nom inconnu « {bettor_name} ». "
+            f"Utilise @Kekko ou @Rapha pour attribuer le pari."
+        )
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    event_date = await find_event_date(desc)
+
+    con = db()
+    cur_ = con.execute(
+        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, is_loro, event_date)
+           VALUES (?, ?, ?, ?, ?, 0, ?, 'waiting', ?, ?, ?)""",
+        (chat_id, update.message.message_id, user.id, bettor_name, desc, odds, now, 1 if is_loro_bet else 0, event_date)
+    )
+    bet_id = cur_.lastrowid
+    con.commit()
+    con.close()
+
+    date_line = ""
+    if event_date:
+        dp = event_date.split('-')
+        date_line = f"   Date evenement : {dp[2]}/{dp[1]}/{dp[0]}\n"
+
+    tag = " [LORO]" if is_loro_bet else ""
+    par = f" (par {bettor_name})" if is_duo(chat_id) or is_loro_bet else ""
+    text = (
+        f"Pari #{bet_id} pre-enregistre{tag}\n"
+        f"   {desc} @ {odds:.2f}{par}\n"
+        f"{date_line}"
+        f"   Mise : en attente\n\n"
+        f"→ /confirm {bet_id} <mise> pour valider"
+    )
+    await update.message.reply_text(text)
+
+    if is_loro_bet:
+        sheet_tab = "Loro"
+    elif is_duo(chat_id):
+        sheet_tab = "Kekko-Rapha"
+    else:
+        sheet_tab = "Paris"
+
+    sync_payload = {
+        "action": "new_bet",
+        "id": bet_id,
+        "date": now[:10],
+        "description": desc,
+        "stake": 0,
+        "odds": odds,
+        "user_name": bettor_name,
+        "sheet_tab": sheet_tab,
+        "status": "WAITING"
+    }
+    if event_date:
+        sync_payload["event_date"] = event_date
+    await sync_sheets(sync_payload)
+
+
+# ── /confirm — Confirmer la mise d'un pari en attente ────────
+async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Format : /confirm <id> <mise> [-Annexe montant]\n"
+            "Ex: /confirm 327 3000\n"
+            "Ex: /confirm 327 5000 -Rago 1000"
+        )
+        return
+
+    try:
+        bet_id = int(ctx.args[0].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("ID invalide.")
+        return
+
+    try:
+        stake = float(ctx.args[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Mise invalide.")
+        return
+
+    if stake <= 0:
+        await update.message.reply_text("La mise doit etre positive.")
+        return
+
+    chat_id = update.message.chat_id
+    con = db()
+    bet = con.execute(
+        "SELECT * FROM bets WHERE id = ? AND chat_id = ?",
+        (bet_id, chat_id)
+    ).fetchone()
+
+    if not bet:
+        con.close()
+        await update.message.reply_text(f"Pari #{bet_id} introuvable.")
+        return
+
+    if bet["status"] != "waiting":
+        con.close()
+        await update.message.reply_text(f"Pari #{bet_id} n'est pas en attente de confirmation (statut: {bet['status']}).")
+        return
+
+    # Parse optional annexe: /confirm 327 3000 -Rago 500
+    annexe_name = None
+    annexe_stake = 0.0
+    remainder = " ".join(ctx.args[2:])
+    bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
+
+    if not is_duo(chat_id) or bet_is_loro:
+        annexe_match = re.search(r'-(\w+)\s+(\d+(?:[.,]\d+)?)', remainder)
+        if annexe_match:
+            annexe_name = annexe_match.group(1).capitalize()
+            annexe_stake = float(annexe_match.group(2).replace(",", "."))
+            if annexe_stake >= stake:
+                con.close()
+                await update.message.reply_text("La mise annexe doit etre inferieure a la mise totale.")
+                return
+
+    con.execute(
+        "UPDATE bets SET stake = ?, status = 'pending', annexe_name = ?, annexe_stake = ? WHERE id = ?",
+        (stake, annexe_name, annexe_stake, bet_id)
+    )
+    con.commit()
+
+    odds = bet["odds"]
+    desc = bet["description"]
+    bettor_name = bet["user_name"]
+    c = cur(chat_id)
+
+    if bet_is_loro:
+        loro_s = stake - annexe_stake
+        pp = loro_s / 2
+        gain_pp = loro_s * (odds - 1) / 2
+        if annexe_name:
+            gain_annexe = annexe_stake * (odds - 1)
+            text = (
+                f"Pari #{bet_id} confirme [LORO]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"   Mise : {stake:.0f} CHF\n"
+                f"   ├ Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
+                f"   Gain potentiel : +{gain_pp:.0f}/pers. (+{gain_annexe:.0f} {annexe_name})\n\n"
+                f"Resultat → /win ou /loss"
+            )
+        else:
+            text = (
+                f"Pari #{bet_id} confirme [LORO]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   Gain potentiel : +{gain_pp:.0f}/pers.\n\n"
+                f"Resultat → /win ou /loss"
+            )
+        con.close()
+        await update.message.reply_text(text)
+        sync_p = {"action": "confirm_bet", "id": bet_id, "stake": stake, "sheet_tab": "Loro"}
+        if annexe_name:
+            sync_p["annexe_name"] = annexe_name
+            sync_p["annexe_stake"] = annexe_stake
+        await sync_sheets(sync_p)
+        return
+
+    if is_duo(chat_id):
+        gain = stake * (odds - 1)
+        tc = get_duo_tricount(con, chat_id)
+        balance_text = format_tricount_balance(tc, chat_id)
+        con.close()
+        text = (
+            f"Pari #{bet_id} confirme\n"
+            f"   {desc} @ {odds:.2f}\n"
+            f"   Mise : {stake:.0f} {c} (par {bettor_name})\n"
+            f"   Gain potentiel : {fmt(gain, chat_id)}\n\n"
+            f"Balance : {balance_text}\n"
+            f"Resultat → /win ou /loss"
+        )
+    elif annexe_name:
+        trio_s = stake - annexe_stake
+        pp = trio_s / NB_PARTS
+        gain_pp = trio_s * (odds - 1) / NB_PARTS
+        con.close()
+        text = (
+            f"Pari #{bet_id} confirme\n"
+            f"   {desc} @ {odds:.2f}\n"
+            f"   Mise : {stake:.0f} {c}\n"
+            f"   ├ Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
+            f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
+            f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
+            f"Resultat → /win ou /loss"
+        )
+    else:
+        pp = stake / NB_PARTS
+        gain_pp = stake * (odds - 1) / NB_PARTS
+        con.close()
+        text = (
+            f"Pari #{bet_id} confirme\n"
+            f"   {desc} @ {odds:.2f}\n"
+            f"   Mise : {stake:.0f} {c} ({pp:.0f}/pers.)\n"
+            f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
+            f"Resultat → /win ou /loss"
+        )
+
+    await update.message.reply_text(text)
+
+    sheet_tab = "Loro" if bet_is_loro else ("Kekko-Rapha" if is_duo(chat_id) else "Paris")
+    sync_p = {"action": "confirm_bet", "id": bet_id, "stake": stake, "sheet_tab": sheet_tab}
+    if annexe_name:
+        sync_p["annexe_name"] = annexe_name
+        sync_p["annexe_stake"] = annexe_stake
+    await sync_sheets(sync_p)
+
+
+# ── Batch result helper ──────────────────────────────────────
+async def _batch_result(msg, chat_id, status, bet_ids):
+    """Resolve multiple bets at once."""
+    con = db()
+    now = datetime.now(timezone.utc).isoformat()
+    icons = {"won": "✅", "lost": "❌", "void": "↩️"}
+    icon = icons.get(status, "?")
+    status_label = {"won": "GAGNE", "lost": "PERDU", "void": "ANNULE"}
+
+    resolved = []
+    skipped = []
+
+    for bid in bet_ids:
+        bet = con.execute(
+            "SELECT * FROM bets WHERE id = ? AND chat_id = ?",
+            (bid, chat_id)
+        ).fetchone()
+        if not bet:
+            skipped.append((bid, "introuvable"))
+            continue
+        if bet["status"] == status:
+            skipped.append((bid, f"deja {status}"))
+            continue
+        if bet["status"] == "waiting":
+            skipped.append((bid, "pas confirme"))
+            continue
+        if bet["status"] not in ("pending",):
+            skipped.append((bid, f"statut {bet['status']}"))
+            continue
+
+        con.execute("UPDATE bets SET status = ?, resolved_at = ? WHERE id = ?", (status, now, bid))
+
+        stake = bet["stake"]
+        odds = bet["odds"]
+        annexe_s = bet["annexe_stake"] or 0
+        bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
+
+        if bet_is_loro:
+            loro_s = stake - annexe_s
+            pnl = bet_pnl(loro_s, odds, status) / 2
+            pnl_text = f"{pnl:+.0f}/pers."
+        elif is_duo(chat_id):
+            pnl = bet_pnl(stake, odds, status)
+            pnl_text = fmt(pnl, chat_id)
+        else:
+            trio_s = stake - annexe_s
+            pnl = bet_pnl(trio_s, odds, status) / NB_PARTS
+            pnl_text = fmt(pnl, chat_id) + "/pers."
+
+        tag = " [LORO]" if bet_is_loro else ""
+        resolved.append((bid, bet["description"], odds, pnl_text, bet_is_loro, tag))
+
+    con.commit()
+
+    lines = [f"{len(resolved)} paris resolus : {status_label.get(status, status.upper())}\n"]
+    for bid, desc, odds, pnl_text, _, tag in resolved:
+        lines.append(f"{icon} #{bid} {desc} @ {odds:.2f} → {pnl_text}{tag}")
+
+    if skipped:
+        lines.append("")
+        for bid, reason in skipped:
+            lines.append(f"⚠️ #{bid} : {reason}")
+
+    if is_duo(chat_id):
+        tc = get_duo_tricount(con, chat_id)
+        balance_text = format_tricount_balance(tc, chat_id)
+        lines.append(f"\nBalance : {balance_text}")
+    else:
+        rows = con.execute(
+            "SELECT status, stake, odds, annexe_stake FROM bets WHERE chat_id = ? AND status IN ('won','lost') AND (is_loro IS NULL OR is_loro = 0)",
+            (chat_id,)
+        ).fetchall()
+        total_pnl = sum(bet_pnl(r["stake"] - (r["annexe_stake"] or 0), r["odds"], r["status"]) / NB_PARTS for r in rows)
+        lines.append(f"\nP&L cumule : {fmt(total_pnl, chat_id)}/pers.")
+
+    con.close()
+    await msg.reply_text("\n".join(lines))
+
+    for bid, desc, odds, pnl_text, is_loro, tag in resolved:
+        if is_loro:
+            sheet_tab = "Loro"
+        elif is_duo(chat_id):
+            sheet_tab = "Kekko-Rapha"
+        else:
+            sheet_tab = "Paris"
+        await sync_sheets({"action": "update_bet", "id": bid, "status": status, "sheet_tab": sheet_tab})
+
+
 # ── /win /loss /void — Résultat d'un pari ───────────────────
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -676,6 +1041,25 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = status_map.get(command)
     if not status:
         return
+
+    # ── Batch mode: /win 14 to 19 or /win 14-19 ──
+    if ctx.args:
+        batch_ids = None
+        if len(ctx.args) >= 3 and ctx.args[1].lower() in ('to', 'a', 'à'):
+            try:
+                start_id = int(ctx.args[0])
+                end_id = int(ctx.args[2])
+                batch_ids = list(range(min(start_id, end_id), max(start_id, end_id) + 1))
+            except ValueError:
+                pass
+        elif len(ctx.args) == 1 and re.match(r'^\d+-\d+$', ctx.args[0]):
+            parts = ctx.args[0].split('-')
+            start_id, end_id = int(parts[0]), int(parts[1])
+            batch_ids = list(range(min(start_id, end_id), max(start_id, end_id) + 1))
+
+        if batch_ids and len(batch_ids) > 1:
+            await _batch_result(msg, chat_id, status, batch_ids)
+            return
 
     con = db()
     bet = None
@@ -1377,9 +1761,13 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"SELECT * FROM bets WHERE chat_id = ? AND status = 'pending'{loro_filter} ORDER BY id",
         (chat_id,)
     ).fetchall()
+    waiting = con.execute(
+        f"SELECT * FROM bets WHERE chat_id = ? AND status = 'waiting'{loro_filter} ORDER BY id",
+        (chat_id,)
+    ).fetchall()
     con.close()
 
-    if not rows:
+    if not rows and not waiting:
         await update.message.reply_text("Aucun pari en attente.")
         return
 
@@ -1396,7 +1784,18 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"#{r['id']}{par} | {r['description']} @ {r['odds']:.2f} | "
             f"{r['stake']:.0f} {c}{annexe_tag}{pp}"
         )
+
+    if waiting:
+        lines.append("\nEN ATTENTE DE MISE :")
+        for r in waiting:
+            par = f" [{r['user_name']}]" if duo else ""
+            lines.append(
+                f"⏸ #{r['id']}{par} | {r['description']} @ {r['odds']:.2f} | "
+                f"mise: ? → /confirm {r['id']} <mise>"
+            )
+
     lines.append(f"\n→ /win <id> ou /loss <id> pour marquer le resultat")
+    lines.append(f"→ /win <id> to <id> pour resulter en batch")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1515,10 +1914,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"  /lock 800 Strasbourg 1N2 3,10\n"
             f"  /lock 500 Basel ML 2,10 @loro — pari Loro (CHF)\n"
             f"  /lock 500 Basel ML 2,10 -Rago 100 @loro — Loro + annexe\n"
+            f"  /wait PSG ML 1,80 — pre-enregistre sans mise\n"
+            f"  /confirm 327 3000 — confirme la mise\n"
             f"  → enregistre 800 {c} par toi pour l'autre\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
-            "  /loss (repondre au pari ou /loss <id>)\n\n"
+            "  /loss (repondre au pari ou /loss <id>)\n"
+            "  /win 14 to 19 — resulter en batch\n\n"
             "Transactions :\n"
             "  /depense 80 restaurant — frais partage (tu as paye)\n"
             "  /depense Rapha 50 uber — frais partage (Rapha a paye)\n"
@@ -1543,10 +1945,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /lock 800 Strasbourg 1N2 3,10\n"
             "  /lock 500 Le Mans ML 1.70\n"
             "  /lock 7000 Real ML 1,50 -Julien 1000\n"
-            "     → annexe : 1000 pour Julien, 6000 trio\n\n"
+            "     → annexe : 1000 pour Julien, 6000 trio\n"
+            "  /wait PSG ML 1,80 — pre-enregistre sans mise\n"
+            "  /confirm 327 3000 — confirme la mise\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
             "  /loss (repondre au pari ou /loss <id>)\n"
+            "  /win 14 to 19 — resulter en batch\n"
             "  /void (annule/rembourse)\n\n"
             "Transactions :\n"
             "  /remb Marco 100 a Kekko — transfert direct\n"
@@ -2230,6 +2635,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("wait", cmd_wait))
+    app.add_handler(CommandHandler("confirm", cmd_confirm))
     for cmd in ["win", "w", "gagne", "loss", "lose", "l", "perdu", "void", "push", "annule"]:
         app.add_handler(CommandHandler(cmd, cmd_result))
 
@@ -2269,6 +2676,8 @@ def main():
     async def post_init(application):
         await application.bot.set_my_commands([
             ("lock", "Enregistrer un pari"),
+            ("wait", "Pre-enregistrer sans mise"),
+            ("confirm", "Confirmer la mise d'un /wait"),
             ("solde", "Voir le solde P&L"),
             ("soldeloro", "P&L paris Loro (CHF)"),
             ("dettes", "Voir qui doit quoi"),
