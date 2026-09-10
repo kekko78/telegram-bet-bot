@@ -145,61 +145,40 @@ def get_duo_tricount(con, chat_id: int) -> dict:
     if len(users) < 2:
         return None
 
-    # N-way fair split: each person's fair share = total contributions / N
-    n = len(users)
-    total_contribution = sum(contribution.get(u, 0) for u in users)
-    fair_share = total_contribution / n
+    a, b = users[0], users[1]
 
-    # Per-user balance: positive = others owe them, negative = they owe others
-    balances = {}
-    for u in users:
-        balances[u] = contribution.get(u, 0) - fair_share
+    # Direct contribution difference — NO fair-share division
+    # Each bet is attributed 100% to the bettor, balance = diff of contributions
+    contrib_bal = contribution.get(a, 0) - contribution.get(b, 0)
 
-    # Apply direct transfers to balances
+    # Direct transfers offset the debt
+    net_b_to_a = 0.0
     for t in txs:
-        balances[t["from_name"]] = balances.get(t["from_name"], 0) + t["amount"]
-        balances[t["to_name"]] = balances.get(t["to_name"], 0) - t["amount"]
+        if t["from_name"] == b and t["to_name"] == a:
+            net_b_to_a += t["amount"]
+        elif t["from_name"] == a and t["to_name"] == b:
+            net_b_to_a -= t["amount"]
 
-    # Backward compat: keep "a" and "b" as first two users
-    a = users[0]
-    b = users[1] if len(users) > 1 else users[0]
+    balance = contrib_bal - net_b_to_a
 
     return {
-        "balances": balances, "users": users, "a": a, "b": b,
+        "balance": balance, "a": a, "b": b,
         "contribution": contribution, "pending_stakes": pending_stakes,
         "pending_count": pending_count, "pnl": pnl, "wins": wins, "losses": losses,
-        "expense_total": expense_total,
+        "expense_total": expense_total, "net_b_to_a": net_b_to_a,
     }
 
 
 def format_tricount_balance(tc: dict, chat_id: int) -> str:
     if not tc:
         return "Pas encore de donnees"
-    balances = tc["balances"]
-    c = cur(chat_id)
-
-    # Compute minimal settlement transfers (greedy algorithm)
-    debtors = sorted([(n, -b) for n, b in balances.items() if b < -0.5], key=lambda x: -x[1])
-    creditors = sorted([(n, b) for n, b in balances.items() if b > 0.5], key=lambda x: -x[1])
-
-    if not debtors and not creditors:
-        return "Vous etes a jour !"
-
-    transfers = []
-    di = ci = 0
-    d = [list(x) for x in debtors]
-    cr = [list(x) for x in creditors]
-    while di < len(d) and ci < len(cr):
-        transfer = min(d[di][1], cr[ci][1])
-        transfers.append(f"{d[di][0]} doit {transfer:.0f} {c} a {cr[ci][0]}")
-        d[di][1] -= transfer
-        cr[ci][1] -= transfer
-        if d[di][1] < 0.5:
-            di += 1
-        if cr[ci][1] < 0.5:
-            ci += 1
-
-    return " | ".join(transfers) if transfers else "Vous etes a jour !"
+    bal = tc["balance"]
+    a, b, c = tc["a"], tc["b"], cur(chat_id)
+    if bal > 0.5:
+        return f"{b} doit {bal:.0f} {c} a {a}"
+    elif bal < -0.5:
+        return f"{a} doit {abs(bal):.0f} {c} a {b}"
+    return "Vous etes a jour !"
 
 
 def get_group_tricount(con, chat_id: int) -> dict:
@@ -1248,7 +1227,7 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wr = (total_wins / total_resolved * 100) if total_resolved > 0 else 0
 
         lines = [f"SOLDE DUO\n\nBalance : {balance_text}\n"]
-        for u in tc["users"]:
+        for u in [tc["a"], tc["b"]]:
             w = tc["wins"].get(u, 0)
             lo = tc["losses"].get(u, 0)
             p = tc["pending_count"].get(u, 0)
@@ -1594,8 +1573,9 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         lines = [f"TRICOUNT\n\n{balance_text}\n"]
 
+        duo_users = [tc["a"], tc["b"]]
         lines.append("--- Paris ---")
-        for u in tc["users"]:
+        for u in duo_users:
             w = tc["wins"].get(u, 0)
             lo = tc["losses"].get(u, 0)
             p = tc["pending_count"].get(u, 0)
@@ -1611,7 +1591,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if tc["expense_total"]:
             lines.append("\n--- Depenses ---")
-            for u in tc["users"]:
+            for u in duo_users:
                 if u in tc["expense_total"]:
                     lines.append(f"  {u} a paye : {tc['expense_total'][u]:.0f} {c}")
 
@@ -1624,24 +1604,13 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for tx in tx_list[:5]:
                 lines.append(f"  {tx['from_name']}→{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
 
-        # Settlement suggestions
-        balances = tc["balances"]
-        debtors = sorted([(n, -bal) for n, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
-        creditors = sorted([(n, bal) for n, bal in balances.items() if bal > 0.5], key=lambda x: -x[1])
-        if debtors and creditors:
-            lines.append("\nReglements :")
-            di = ci = 0
-            d = [list(x) for x in debtors]
-            cr = [list(x) for x in creditors]
-            while di < len(d) and ci < len(cr):
-                transfer = min(d[di][1], cr[ci][1])
-                lines.append(f"  {d[di][0]} → {cr[ci][0]} : {transfer:.0f} {c}")
-                d[di][1] -= transfer
-                cr[ci][1] -= transfer
-                if d[di][1] < 0.5:
-                    di += 1
-                if cr[ci][1] < 0.5:
-                    ci += 1
+        # Settlement
+        bal = tc["balance"]
+        a, b = tc["a"], tc["b"]
+        if bal > 0.5:
+            lines.append(f"\nReglement : {b} → {a} : {bal:.0f} {c}")
+        elif bal < -0.5:
+            lines.append(f"\nReglement : {a} → {b} : {abs(bal):.0f} {c}")
 
         await update.message.reply_text("\n".join(lines))
         return
@@ -2175,7 +2144,7 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if duo:
         tc = get_duo_tricount(con, chat_id)
         balance_text = format_tricount_balance(tc, chat_id)
-        parts = len(tc["users"]) if tc else 2
+        parts = 2
     else:
         balances = get_group_tricount(con, chat_id)
         balance_text = format_group_tricount(balances, chat_id)
@@ -2258,7 +2227,7 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if duo:
         tc = get_duo_tricount(con, chat_id)
         balance_text = format_tricount_balance(tc, chat_id)
-        parts = len(tc["users"]) if tc else 2
+        parts = 2
     else:
         balances = get_group_tricount(con, chat_id)
         balance_text = format_group_tricount(balances, chat_id)
