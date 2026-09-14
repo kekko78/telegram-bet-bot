@@ -33,6 +33,12 @@ GROUP_DEFAULT_BETTOR = "Marco"
 ANNEXE_HANDLER = "Kekko"  # Alex handles annexe payments/recoveries
 NAME_MAP = {"Twix": "Kekko"}
 DUO_PARTICIPANTS = {"Kekko", "Rapha"}  # Only these 2 share the tricount
+APP_API_URL = os.environ.get("APP_API_URL", "")  # e.g. https://web-production-29fff.up.railway.app
+APP_API_KEY = os.environ.get("APP_API_KEY", "")   # admin key for the app
+
+BOT_TO_APP_NAME = {"Kekko": "Alex"}  # Bot uses Kekko, app uses Alex
+def to_app_name(name: str) -> str:
+    return BOT_TO_APP_NAME.get(name, name)
 
 def parse_name_override(raw: str, update) -> tuple:
     """Parse @name from text OR Telegram mention entities.
@@ -300,7 +306,8 @@ def init_db():
     """)
     # Add annexe columns (safe to re-run)
     for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0"),
-                         ("is_loro", "INTEGER DEFAULT 0"), ("event_date", "TEXT")]:
+                         ("is_loro", "INTEGER DEFAULT 0"), ("event_date", "TEXT"),
+                         ("app_bet_id", "INTEGER")]:
         try:
             con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
@@ -335,6 +342,67 @@ async def sync_sheets(payload: dict):
                 log.info(f"Sheets sync: {payload.get('action')} → {resp.status}")
     except Exception as e:
         log.warning(f"Sheets sync failed: {e}")
+
+# ── Web app sync ──────────────────────────────────────────────
+async def sync_app(action: str, data: dict):
+    """Sync to the web app (bet-tricount-app)."""
+    if not APP_API_URL or not APP_API_KEY:
+        return None
+    url_base = APP_API_URL.rstrip("/")
+    try:
+        async with aiohttp.ClientSession() as session:
+            if action == "create_bet":
+                url = f"{url_base}/api/bets?key={APP_API_KEY}"
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        log.info(f"App sync: created bet → app_id={result.get('id')}")
+                        return result.get("id")
+                    else:
+                        log.warning(f"App sync create_bet failed: HTTP {resp.status}")
+            elif action == "update_bet":
+                app_bet_id = data.pop("app_bet_id", None)
+                if not app_bet_id:
+                    return None
+                url = f"{url_base}/api/bets/{app_bet_id}?key={APP_API_KEY}"
+                async with session.patch(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    log.info(f"App sync: update bet {app_bet_id} → {resp.status}")
+            elif action == "delete_bet":
+                app_bet_id = data.get("app_bet_id")
+                if not app_bet_id:
+                    return None
+                url = f"{url_base}/api/bets/{app_bet_id}?key={APP_API_KEY}"
+                # Set status to void since app doesn't have DELETE for bets
+                async with session.patch(url, json={"status": "void"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    log.info(f"App sync: void bet {app_bet_id} → {resp.status}")
+            elif action == "create_transaction":
+                url = f"{url_base}/api/transactions?key={APP_API_KEY}"
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        log.info(f"App sync: created tx → app_id={result.get('id')}")
+                        return result.get("id")
+                    else:
+                        log.warning(f"App sync create_transaction failed: HTTP {resp.status}")
+            elif action == "delete_transaction":
+                app_tx_id = data.get("app_tx_id")
+                if not app_tx_id:
+                    return None
+                url = f"{url_base}/api/transactions/{app_tx_id}?key={APP_API_KEY}"
+                async with session.delete(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    log.info(f"App sync: delete tx {app_tx_id} → {resp.status}")
+    except Exception as e:
+        log.warning(f"App sync ({action}) failed: {e}")
+    return None
+
+
+def bot_to_app_channel(chat_id: int, is_loro_bet: bool = False) -> str:
+    """Map bot chat context to app channel."""
+    if is_loro_bet:
+        return "loro"
+    if is_duo(chat_id):
+        return "direct"  # K/R duo bets = direct (100% for one person)
+    return "marco"  # group = marco
 
 # ── Event date lookup ──────────────────────────────────────────
 _BET_NOISE = re.compile(
@@ -534,6 +602,30 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bet_id = cur_.lastrowid
     con.commit()
     con.close()
+
+    # Sync to web app
+    app_channel = bot_to_app_channel(chat_id, is_loro_bet)
+    app_payer = to_app_name(bettor_name)
+    app_payload = {
+        "date": now[:10],
+        "description": desc,
+        "stake": stake,
+        "odds": odds,
+        "currency": "CHF" if (not is_duo(chat_id) or is_loro_bet) else "EUR",
+        "channel": app_channel,
+        "payer": app_payer,
+        "direct_owner": app_payer if app_channel == "direct" else None,
+        "rago_share": 0,
+        "annexe_name": annexe_name,
+        "annexe_stake": annexe_stake,
+        "source": "bot",
+    }
+    app_bet_id = await sync_app("create_bet", app_payload)
+    if app_bet_id:
+        con2 = db()
+        con2.execute("UPDATE bets SET app_bet_id = ? WHERE id = ?", (app_bet_id, bet_id))
+        con2.commit()
+        con2.close()
 
     date_line = ""
     if event_date:
@@ -834,6 +926,29 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     con.commit()
 
+    # Sync to web app — create bet on confirm (waiting bets aren't synced)
+    now = datetime.now(timezone.utc).isoformat()
+    app_channel = bot_to_app_channel(chat_id, bet_is_loro)
+    app_payer = to_app_name(bet["user_name"])
+    app_payload = {
+        "date": bet["created_at"][:10] if bet["created_at"] else now[:10],
+        "description": bet["description"],
+        "stake": stake,
+        "odds": bet["odds"],
+        "currency": "CHF" if (not is_duo(chat_id) or bet_is_loro) else "EUR",
+        "channel": app_channel,
+        "payer": app_payer,
+        "direct_owner": app_payer if app_channel == "direct" else None,
+        "rago_share": 0,
+        "annexe_name": annexe_name if annexe_name else None,
+        "annexe_stake": annexe_stake,
+        "source": "bot",
+    }
+    app_bet_id = await sync_app("create_bet", app_payload)
+    if app_bet_id:
+        con.execute("UPDATE bets SET app_bet_id = ? WHERE id = ?", (app_bet_id, bet_id))
+        con.commit()
+
     odds = bet["odds"]
     desc = bet["description"]
     bettor_name = bet["user_name"]
@@ -1095,6 +1210,14 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc).isoformat()
     con.execute("UPDATE bets SET status = ?, resolved_at = ? WHERE id = ?", (status, now, bet["id"]))
     con.commit()
+
+    # Sync status to web app
+    try:
+        app_bid = bet["app_bet_id"]
+    except (IndexError, KeyError):
+        app_bid = None
+    if app_bid:
+        await sync_app("update_bet", {"app_bet_id": app_bid, "status": status, "source": "bot"})
 
     stake = bet["stake"]
     odds = bet["odds"]
@@ -1790,11 +1913,18 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Pari #{bet_id} introuvable.")
         return
     bet_is_loro = bool(bet["is_loro"]) if bet["is_loro"] else False
+    try:
+        app_bid = bet["app_bet_id"]
+    except (IndexError, KeyError):
+        app_bid = None
     con.execute("DELETE FROM bets WHERE id = ?", (bet_id,))
     con.commit()
     con.close()
     tag = " [LORO]" if bet_is_loro else ""
     await update.message.reply_text(f"Pari #{bet_id} supprime ({bet['description']}){tag}.")
+
+    if app_bid:
+        await sync_app("delete_bet", {"app_bet_id": app_bid})
 
     if bet_is_loro:
         sheet_tab = "Loro"
@@ -1984,6 +2114,18 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     tx_id = cur_.lastrowid
     con.commit()
+
+    # Sync to web app
+    app_currency = cur(chat_id)
+    await sync_app("create_transaction", {
+        "date": now[:10],
+        "from_person": to_app_name(from_name),
+        "to_person": to_app_name(to_name),
+        "amount": amount,
+        "currency": app_currency,
+        "description": description,
+        "source": "bot",
+    })
 
     # Show updated balance
     if is_duo(chat_id):
@@ -2224,6 +2366,17 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     exp_id = cur_.lastrowid
     con.commit()
 
+    # Sync to web app
+    await sync_app("create_transaction", {
+        "date": now[:10],
+        "from_person": to_app_name(received_by),
+        "to_person": to_app_name(received_by),
+        "amount": amount,
+        "currency": c,
+        "description": f"[RETRAIT] {description}",
+        "source": "bot",
+    })
+
     if duo:
         tc = get_duo_tricount(con, chat_id)
         balance_text = format_tricount_balance(tc, chat_id)
@@ -2298,6 +2451,14 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc).isoformat()
     con.execute("UPDATE bets SET status = ?, resolved_at = ? WHERE id = ?", (status, now, bet["id"]))
     con.commit()
+
+    # Sync status to web app
+    try:
+        app_bid = bet["app_bet_id"]
+    except (IndexError, KeyError):
+        app_bid = None
+    if app_bid:
+        await sync_app("update_bet", {"app_bet_id": app_bid, "status": status, "source": "bot"})
 
     stake = bet["stake"]
     odds = bet["odds"]
