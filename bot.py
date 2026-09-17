@@ -396,6 +396,29 @@ async def sync_app(action: str, data: dict):
     return None
 
 
+async def lookup_app_bet_id(description: str, stake: float, channel: str) -> int | None:
+    """Find a bet in the app by matching description+stake+channel. Returns app bet ID or None."""
+    if not APP_API_URL or not APP_API_KEY:
+        return None
+    url_base = APP_API_URL.rstrip("/")
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"{url_base}/api/bets?key={APP_API_KEY}&channel={channel}&status=pending"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                bets = await resp.json()
+                desc_lower = description.strip().lower()
+                for b in bets:
+                    if (b.get("description", "").strip().lower() == desc_lower
+                            and abs(b.get("stake", 0) - stake) < 0.01):
+                        log.info(f"App lookup: matched '{description}' → app_id={b['id']}")
+                        return b["id"]
+    except Exception as e:
+        log.warning(f"App lookup failed: {e}")
+    return None
+
+
 def bot_to_app_channel(chat_id: int, is_loro_bet: bool = False) -> str:
     """Map bot chat context to app channel."""
     if is_loro_bet:
@@ -1216,6 +1239,16 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         app_bid = bet["app_bet_id"]
     except (IndexError, KeyError):
         app_bid = None
+    if not app_bid:
+        # Fallback: find bet in app by description+stake
+        bet_is_loro_tmp = bool(bet["is_loro"]) if bet["is_loro"] else False
+        channel = bot_to_app_channel(chat_id, bet_is_loro_tmp)
+        app_bid = await lookup_app_bet_id(bet["description"], bet["stake"], channel)
+        if app_bid:
+            con2 = db()
+            con2.execute("UPDATE bets SET app_bet_id = ? WHERE id = ?", (app_bid, bet["id"]))
+            con2.commit()
+            con2.close()
     if app_bid:
         await sync_app("update_bet", {"app_bet_id": app_bid, "status": status, "source": "bot"})
 
@@ -1917,6 +1950,10 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         app_bid = bet["app_bet_id"]
     except (IndexError, KeyError):
         app_bid = None
+    if not app_bid:
+        # Fallback: find bet in app by description+stake
+        channel = bot_to_app_channel(chat_id, bet_is_loro)
+        app_bid = await lookup_app_bet_id(bet["description"], bet["stake"], channel)
     con.execute("DELETE FROM bets WHERE id = ?", (bet_id,))
     con.commit()
     con.close()
@@ -2457,6 +2494,16 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         app_bid = bet["app_bet_id"]
     except (IndexError, KeyError):
         app_bid = None
+    if not app_bid:
+        # Fallback: find bet in app by description+stake
+        bet_is_loro_tmp = bool(bet["is_loro"]) if bet["is_loro"] else False
+        channel = bot_to_app_channel(chat_id, bet_is_loro_tmp)
+        app_bid = await lookup_app_bet_id(bet["description"], bet["stake"], channel)
+        if app_bid:
+            con2 = db()
+            con2.execute("UPDATE bets SET app_bet_id = ? WHERE id = ?", (app_bid, bet["id"]))
+            con2.commit()
+            con2.close()
     if app_bid:
         await sync_app("update_bet", {"app_bet_id": app_bid, "status": status, "source": "bot"})
 
