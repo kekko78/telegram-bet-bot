@@ -2,11 +2,11 @@
 Telegram Bet Tracker Bot
 Deux modes :
   - Groupe (Bets Suisse) : divise par 3, CHF, bankroll commune
-  - Duo (Kekko-Rapha) : Tricount style, EUR, qui doit quoi à qui
+  - Duo (Kekko-Rapha) : Tricount style, EUR, qui doit quoi Ã  qui
 
 Usage principal :
   /lock 800 Strasbourg 1N2 3,10
-  → Enregistre un pari
+  â Enregistre un pari
 """
 import os
 import re
@@ -21,7 +21,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ── Config ──────────────────────────────────────────────────
+# ââ Config ââââââââââââââââââââââââââââââââââââââââââââââââââ
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
 NB_PARTS = 3
@@ -72,7 +72,7 @@ def parse_name_override(raw: str, update) -> tuple:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Mode helpers ─────────────────────────────────────────────
+# ââ Mode helpers âââââââââââââââââââââââââââââââââââââââââââââ
 def is_duo(chat_id: int) -> bool:
     return DUO_CHAT_ID != 0 and chat_id == DUO_CHAT_ID
 
@@ -100,7 +100,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
     Returns dict with per-user balances or None.
     Excludes Loro bets (separate CHF tracking)."""
     bets = con.execute(
-        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND (is_loro IS NULL OR is_loro = 0)", (chat_id,)
+        "SELECT user_name, stake, odds, status FROM bets WHERE chat_id = ? AND (is_loro IS NULL OR is_loro = 0) AND (is_charly IS NULL OR is_charly = 0)", (chat_id,)
     ).fetchall()
     txs = con.execute(
         "SELECT from_name, to_name, amount FROM transactions WHERE chat_id = ?", (chat_id,)
@@ -153,7 +153,7 @@ def get_duo_tricount(con, chat_id: int) -> dict:
 
     a, b = users[0], users[1]
 
-    # Direct contribution difference — NO fair-share division
+    # Direct contribution difference â NO fair-share division
     # Each bet is attributed 100% to the bettor, balance = diff of contributions
     contrib_bal = contribution.get(a, 0) - contribution.get(b, 0)
 
@@ -265,7 +265,7 @@ def get_transactions_list(con, chat_id: int) -> list:
         (chat_id,)
     ).fetchall()
 
-# ── Database ────────────────────────────────────────────────
+# ââ Database ââââââââââââââââââââââââââââââââââââââââââââââââ
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -306,7 +306,7 @@ def init_db():
     """)
     # Add annexe columns (safe to re-run)
     for col, typedef in [("annexe_name", "TEXT"), ("annexe_stake", "REAL DEFAULT 0"),
-                         ("is_loro", "INTEGER DEFAULT 0"), ("event_date", "TEXT"),
+                         ("is_loro", "INTEGER DEFAULT 0"), ("is_charly", "INTEGER DEFAULT 0"), ("event_date", "TEXT"),
                          ("app_bet_id", "INTEGER")]:
         try:
             con.execute(f"ALTER TABLE bets ADD COLUMN {col} {typedef}")
@@ -329,7 +329,7 @@ def db():
     con.row_factory = sqlite3.Row
     return con
 
-# ── Google Sheets sync ─────────────────────────────────────
+# ââ Google Sheets sync âââââââââââââââââââââââââââââââââââââ
 async def sync_sheets(payload: dict):
     if not SHEETS_WEBHOOK_URL:
         return
@@ -339,11 +339,11 @@ async def sync_sheets(payload: dict):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(SHEETS_WEBHOOK_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                log.info(f"Sheets sync: {payload.get('action')} → {resp.status}")
+                log.info(f"Sheets sync: {payload.get('action')} â {resp.status}")
     except Exception as e:
         log.warning(f"Sheets sync failed: {e}")
 
-# ── Web app sync ──────────────────────────────────────────────
+# ââ Web app sync ââââââââââââââââââââââââââââââââââââââââââââââ
 async def sync_app(action: str, data: dict):
     """Sync to the web app (bet-tricount-app)."""
     if not APP_API_URL or not APP_API_KEY:
@@ -356,7 +356,7 @@ async def sync_app(action: str, data: dict):
                 async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         result = await resp.json()
-                        log.info(f"App sync: created bet → app_id={result.get('id')}")
+                        log.info(f"App sync: created bet â app_id={result.get('id')}")
                         return result.get("id")
                     else:
                         log.warning(f"App sync create_bet failed: HTTP {resp.status}")
@@ -366,7 +366,7 @@ async def sync_app(action: str, data: dict):
                     return None
                 url = f"{url_base}/api/bets/{app_bet_id}?key={APP_API_KEY}"
                 async with session.patch(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    log.info(f"App sync: update bet {app_bet_id} → {resp.status}")
+                    log.info(f"App sync: update bet {app_bet_id} â {resp.status}")
             elif action == "delete_bet":
                 app_bet_id = data.get("app_bet_id")
                 if not app_bet_id:
@@ -374,13 +374,13 @@ async def sync_app(action: str, data: dict):
                 url = f"{url_base}/api/bets/{app_bet_id}?key={APP_API_KEY}"
                 # Set status to void since app doesn't have DELETE for bets
                 async with session.patch(url, json={"status": "void"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    log.info(f"App sync: void bet {app_bet_id} → {resp.status}")
+                    log.info(f"App sync: void bet {app_bet_id} â {resp.status}")
             elif action == "create_transaction":
                 url = f"{url_base}/api/transactions?key={APP_API_KEY}"
                 async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         result = await resp.json()
-                        log.info(f"App sync: created tx → app_id={result.get('id')}")
+                        log.info(f"App sync: created tx â app_id={result.get('id')}")
                         return result.get("id")
                     else:
                         log.warning(f"App sync create_transaction failed: HTTP {resp.status}")
@@ -390,7 +390,7 @@ async def sync_app(action: str, data: dict):
                     return None
                 url = f"{url_base}/api/transactions/{app_tx_id}?key={APP_API_KEY}"
                 async with session.delete(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    log.info(f"App sync: delete tx {app_tx_id} → {resp.status}")
+                    log.info(f"App sync: delete tx {app_tx_id} â {resp.status}")
     except Exception as e:
         log.warning(f"App sync ({action}) failed: {e}")
     return None
@@ -412,22 +412,24 @@ async def lookup_app_bet_id(description: str, stake: float, channel: str) -> int
                 for b in bets:
                     if (b.get("description", "").strip().lower() == desc_lower
                             and abs(b.get("stake", 0) - stake) < 0.01):
-                        log.info(f"App lookup: matched '{description}' → app_id={b['id']}")
+                        log.info(f"App lookup: matched '{description}' â app_id={b['id']}")
                         return b["id"]
     except Exception as e:
         log.warning(f"App lookup failed: {e}")
     return None
 
 
-def bot_to_app_channel(chat_id: int, is_loro_bet: bool = False) -> str:
+def bot_to_app_channel(chat_id: int, is_loro_bet: bool = False, is_charly_bet: bool = False) -> str:
     """Map bot chat context to app channel."""
     if is_loro_bet:
         return "loro"
+    if is_charly_bet:
+        return "charly"
     if is_duo(chat_id):
         return "direct"  # K/R duo bets = direct (100% for one person)
     return "marco"  # group = marco
 
-# ── Event date lookup ──────────────────────────────────────────
+# ââ Event date lookup ââââââââââââââââââââââââââââââââââââââââââ
 _BET_NOISE = re.compile(
     r'\b(?:ML|1N2|DNB|DC|BTTS|over|under|plus|moins|tirs|3pts?|pts?|buts?|corners?|'
     r'cartons?|mi-temps|mt|handicap|hc|combo|exact|score|CdB|CdC)\b'
@@ -436,10 +438,10 @@ _BET_NOISE = re.compile(
     re.IGNORECASE
 )
 _MONTHS = {
-    "janvier":1,"février":2,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,
-    "juillet":7,"août":8,"aout":8,"septembre":9,"octobre":10,"novembre":11,
-    "décembre":12,"decembre":12,"janv":1,"févr":2,"fevr":2,"avr":4,
-    "juil":7,"sept":9,"oct":10,"nov":11,"déc":12,"dec":12,
+    "janvier":1,"fÃ©vrier":2,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,
+    "juillet":7,"aoÃ»t":8,"aout":8,"septembre":9,"octobre":10,"novembre":11,
+    "dÃ©cembre":12,"decembre":12,"janv":1,"fÃ©vr":2,"fevr":2,"avr":4,
+    "juil":7,"sept":9,"oct":10,"nov":11,"dÃ©c":12,"dec":12,
     "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,"july":7,
     "august":8,"september":9,"october":10,"november":11,"december":12,
     "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,"sep":9,
@@ -506,18 +508,18 @@ async def find_event_date(desc):
         return None
 
 
-# ── /lock — Enregistrer un pari ─────────────────────────────
+# ââ /lock â Enregistrer un pari âââââââââââââââââââââââââââââ
 LOCK_PATTERN = re.compile(
     r"(\d+(?:[.,]\d+)?)"      # groupe 1 : mise
-    r"\s*(?:chf|eur|€)?\s+"   # optionnel devise
-    r"(.+)\s+"                 # groupe 2 : description (greedy → last number = cote)
+    r"\s*(?:chf|eur|â¬)?\s+"   # optionnel devise
+    r"(.+)\s+"                 # groupe 2 : description (greedy â last number = cote)
     r"(?:@\s*)?"               # optionnel "@"
     r"(\d+[.,]\d+)",           # groupe 3 : cote
     re.IGNORECASE
 )
 
 WAIT_PATTERN = re.compile(
-    r"(.+)\s+"                 # groupe 1 : description (greedy → last number = cote)
+    r"(.+)\s+"                 # groupe 1 : description (greedy â last number = cote)
     r"(\d+[.,]\d+)",           # groupe 2 : cote
     re.IGNORECASE
 )
@@ -541,7 +543,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stake = float(m.group(1).replace(",", "."))
     desc = m.group(2).strip()
     desc = re.sub(r'\s*@\s*$', '', desc)
-    desc = re.sub(r'\s+(?:chf|eur|€)\s*$', '', desc, flags=re.IGNORECASE)
+    desc = re.sub(r'\s+(?:chf|eur|â¬)\s*$', '', desc, flags=re.IGNORECASE)
     odds = float(m.group(3).replace(",", "."))
 
     if stake <= 0 or odds < 1.01:
@@ -556,11 +558,17 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Check for @loro (Swiss book, CHF, 50/50 Kekko-Rapha)
     is_loro_bet = False
+    is_charly_bet = False
     loro_match = re.search(r'@\s*loro\b', remainder, re.IGNORECASE)
+    charly_match = re.search(r'@\s*charly\b', remainder, re.IGNORECASE)
     if loro_match:
         is_loro_bet = True
         bettor_name = "Loro"
         remainder = (remainder[:loro_match.start()] + remainder[loro_match.end():]).strip()
+    elif charly_match:
+        is_charly_bet = True
+        bettor_name = "Charly"
+        remainder = (remainder[:charly_match.start()] + remainder[charly_match.end():]).strip()
     else:
         override = re.match(r'@\s*(\S+)', remainder)
         if override:
@@ -592,9 +600,9 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 bettor_name = NAME_MAP.get(raw, raw)
 
     # In duo mode, only DUO_PARTICIPANTS can enter bets without @mention
-    if is_duo(chat_id) and not is_loro_bet and bettor_name not in DUO_PARTICIPANTS:
+    if is_duo(chat_id) and not is_loro_bet and not is_charly_bet and bettor_name not in DUO_PARTICIPANTS:
         await update.message.reply_text(
-            f"Nom inconnu « {bettor_name} ». "
+            f"Nom inconnu Â« {bettor_name} Â». "
             f"Utilise @Kekko ou @Rapha pour attribuer le pari."
         )
         return
@@ -602,7 +610,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Parse -NomAnnexe MONTANT (group mode + Loro)
     annexe_name = None
     annexe_stake = 0.0
-    if not is_duo(chat_id) or is_loro_bet:
+    if not is_duo(chat_id) or is_loro_bet or is_charly_bet:
         annexe_match = re.search(r'-(\w+)\s+(\d+(?:[.,]\d+)?)', remainder)
         if annexe_match:
             annexe_name = annexe_match.group(1).capitalize()
@@ -618,23 +626,23 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     con = db()
     cur_ = con.execute(
-        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake, is_loro, event_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
-        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake, 1 if is_loro_bet else 0, event_date)
+        """INSERT INTO bets (chat_id, message_id, user_id, user_name, description, stake, odds, status, created_at, annexe_name, annexe_stake, is_loro, is_charly, event_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+        (chat_id, update.message.message_id, user.id, bettor_name, desc, stake, odds, now, annexe_name, annexe_stake, 1 if is_loro_bet else 0, 1 if is_charly_bet else 0, event_date)
     )
     bet_id = cur_.lastrowid
     con.commit()
     con.close()
 
     # Sync to web app
-    app_channel = bot_to_app_channel(chat_id, is_loro_bet)
+    app_channel = bot_to_app_channel(chat_id, is_loro_bet, is_charly_bet)
     app_payer = to_app_name(bettor_name)
     app_payload = {
         "date": now[:10],
         "description": desc,
         "stake": stake,
         "odds": odds,
-        "currency": "CHF" if (not is_duo(chat_id) or is_loro_bet) else "EUR",
+        "currency": "USD" if is_charly_bet else "CHF" if (not is_duo(chat_id) or is_loro_bet) else "EUR",
         "channel": app_channel,
         "payer": app_payer,
         "direct_owner": app_payer if app_channel == "direct" else None,
@@ -668,10 +676,10 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"   {desc} @ {odds:.2f}\n"
                 f"{date_line}"
                 f"   Mise : {stake:.0f} CHF\n"
-                f"   ├ Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
-                f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
+                f"   â Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   â Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
                 f"   Gain potentiel : +{gain_pp:.0f}/pers. (+{gain_annexe:.0f} {annexe_name})\n\n"
-                f"Resultat → repondre avec /win ou /loss"
+                f"Resultat â repondre avec /win ou /loss"
             )
         else:
             text = (
@@ -680,7 +688,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{date_line}"
                 f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
                 f"   Gain potentiel : +{gain_loro:.0f} CHF (+{gain_pp:.0f}/pers.)\n\n"
-                f"Resultat → repondre avec /win ou /loss"
+                f"Resultat â repondre avec /win ou /loss"
             )
         await update.message.reply_text(text)
         sync_payload_loro = {
@@ -701,6 +709,52 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await sync_sheets(sync_payload_loro)
         return
 
+    if is_charly_bet:
+        # Charly mode: USD, 50/50 split (minus annexe if any)
+        charly_s = stake - annexe_stake
+        pp = charly_s / 2
+        gain_charly = charly_s * (odds - 1)
+        gain_pp = gain_charly / 2
+        if annexe_name:
+            gain_annexe = annexe_stake * (odds - 1)
+            text = (
+                f"Pari #{bet_id} enregistre [CHARLY]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"{date_line}"
+                f"   Mise : {stake:.0f} USD\n"
+                f"   \u2514 Duo : {charly_s:.0f} USD ({pp:.0f}/pers.)\n"
+                f"   \u2514 Annexe ({annexe_name}) : {annexe_stake:.0f} USD\n"
+                f"   Gain potentiel : +{gain_pp:.0f}/pers. (+{gain_annexe:.0f} {annexe_name})\n\n"
+                f"Resultat \u2192 repondre avec /win ou /loss"
+            )
+        else:
+            text = (
+                f"Pari #{bet_id} enregistre [CHARLY]\n"
+                f"   {desc} @ {odds:.2f}\n"
+                f"{date_line}"
+                f"   Mise : {stake:.0f} USD ({pp:.0f}/pers.)\n"
+                f"   Gain potentiel : +{gain_charly:.0f} USD (+{gain_pp:.0f}/pers.)\n\n"
+                f"Resultat \u2192 repondre avec /win ou /loss"
+            )
+        await update.message.reply_text(text)
+        sync_payload_charly = {
+            "action": "new_bet",
+            "id": bet_id,
+            "date": now[:10],
+            "description": desc,
+            "stake": stake,
+            "odds": odds,
+            "user_name": "Charly",
+            "sheet_tab": "Charly"
+        }
+        if annexe_name:
+            sync_payload_charly["annexe_name"] = annexe_name
+            sync_payload_charly["annexe_stake"] = annexe_stake
+        if event_date:
+            sync_payload_charly["event_date"] = event_date
+        await sync_sheets(sync_payload_charly)
+        return
+
     c = cur(chat_id)
     if is_duo(chat_id):
         gain = stake * (odds - 1)
@@ -715,7 +769,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   Mise : {stake:.0f} {c} (par {bettor_name})\n"
             f"   Gain potentiel : {fmt(gain, chat_id)}\n\n"
             f"Balance : {balance_text}\n"
-            f"Resultat → repondre avec /win ou /loss"
+            f"Resultat â repondre avec /win ou /loss"
         )
     elif annexe_name:
         trio_s = stake - annexe_stake
@@ -726,11 +780,11 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   {desc} @ {odds:.2f}\n"
             f"{date_line}"
             f"   Mise : {stake:.0f} {c}\n"
-            f"   ├ Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
-            f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
+            f"   â Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
+            f"   â Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
             f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n"
             f"   Avance {annexe_stake:.0f} {c} par {bettor_name} pour {annexe_name}\n\n"
-            f"Resultat → repondre a ce message avec /win ou /loss"
+            f"Resultat â repondre a ce message avec /win ou /loss"
         )
     else:
         pp = stake / NB_PARTS
@@ -741,7 +795,7 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{date_line}"
             f"   Mise : {stake:.0f} {c} ({pp:.0f}/pers.)\n"
             f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
-            f"Resultat → repondre a ce message avec /win ou /loss"
+            f"Resultat â repondre a ce message avec /win ou /loss"
         )
     await update.message.reply_text(text)
 
@@ -764,14 +818,14 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets(sync_payload)
 
 
-# ── /wait — Pré-enregistrer un pari sans mise ────────────────
+# ââ /wait â PrÃ©-enregistrer un pari sans mise ââââââââââââââââ
 async def cmd_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text(
             "Format : /wait <description> <cote> [@nom]\n"
             "Ex: /wait PSG vainqueur 1,80\n"
             "Ex: /wait Basel ML 2,10 @Rapha\n"
-            "→ Pre-enregistre sans mise. /confirm <id> <mise> pour valider."
+            "â Pre-enregistre sans mise. /confirm <id> <mise> pour valider."
         )
         return
 
@@ -827,7 +881,7 @@ async def cmd_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_duo(chat_id) and not is_loro_bet and bettor_name not in DUO_PARTICIPANTS:
         await update.message.reply_text(
-            f"Nom inconnu « {bettor_name} ». "
+            f"Nom inconnu Â« {bettor_name} Â». "
             f"Utilise @Kekko ou @Rapha pour attribuer le pari."
         )
         return
@@ -857,7 +911,7 @@ async def cmd_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"   {desc} @ {odds:.2f}{par}\n"
         f"{date_line}"
         f"   Mise : en attente\n\n"
-        f"→ /confirm {bet_id} <mise> pour valider"
+        f"â /confirm {bet_id} <mise> pour valider"
     )
     await update.message.reply_text(text)
 
@@ -884,7 +938,7 @@ async def cmd_wait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets(sync_payload)
 
 
-# ── /confirm — Confirmer la mise d'un pari en attente ────────
+# ââ /confirm â Confirmer la mise d'un pari en attente ââââââââ
 async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
         await update.message.reply_text(
@@ -949,7 +1003,7 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     con.commit()
 
-    # Sync to web app — create bet on confirm (waiting bets aren't synced)
+    # Sync to web app â create bet on confirm (waiting bets aren't synced)
     now = datetime.now(timezone.utc).isoformat()
     app_channel = bot_to_app_channel(chat_id, bet_is_loro)
     app_payer = to_app_name(bet["user_name"])
@@ -987,10 +1041,10 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Pari #{bet_id} confirme [LORO]\n"
                 f"   {desc} @ {odds:.2f}\n"
                 f"   Mise : {stake:.0f} CHF\n"
-                f"   ├ Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
-                f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
+                f"   â Duo : {loro_s:.0f} CHF ({pp:.0f}/pers.)\n"
+                f"   â Annexe ({annexe_name}) : {annexe_stake:.0f} CHF\n"
                 f"   Gain potentiel : +{gain_pp:.0f}/pers. (+{gain_annexe:.0f} {annexe_name})\n\n"
-                f"Resultat → /win ou /loss"
+                f"Resultat â /win ou /loss"
             )
         else:
             text = (
@@ -998,7 +1052,7 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"   {desc} @ {odds:.2f}\n"
                 f"   Mise : {stake:.0f} CHF ({pp:.0f}/pers.)\n"
                 f"   Gain potentiel : +{gain_pp:.0f}/pers.\n\n"
-                f"Resultat → /win ou /loss"
+                f"Resultat â /win ou /loss"
             )
         con.close()
         await update.message.reply_text(text)
@@ -1020,7 +1074,7 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   Mise : {stake:.0f} {c} (par {bettor_name})\n"
             f"   Gain potentiel : {fmt(gain, chat_id)}\n\n"
             f"Balance : {balance_text}\n"
-            f"Resultat → /win ou /loss"
+            f"Resultat â /win ou /loss"
         )
     elif annexe_name:
         trio_s = stake - annexe_stake
@@ -1031,10 +1085,10 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Pari #{bet_id} confirme\n"
             f"   {desc} @ {odds:.2f}\n"
             f"   Mise : {stake:.0f} {c}\n"
-            f"   ├ Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
-            f"   └ Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
+            f"   â Trio : {trio_s:.0f} {c} ({pp:.0f}/pers.)\n"
+            f"   â Annexe ({annexe_name}) : {annexe_stake:.0f} {c}\n"
             f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
-            f"Resultat → /win ou /loss"
+            f"Resultat â /win ou /loss"
         )
     else:
         pp = stake / NB_PARTS
@@ -1045,7 +1099,7 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"   {desc} @ {odds:.2f}\n"
             f"   Mise : {stake:.0f} {c} ({pp:.0f}/pers.)\n"
             f"   Gain potentiel : {fmt(gain_pp, chat_id)}/pers.\n\n"
-            f"Resultat → /win ou /loss"
+            f"Resultat â /win ou /loss"
         )
 
     await update.message.reply_text(text)
@@ -1058,12 +1112,12 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets(sync_p)
 
 
-# ── Batch result helper ──────────────────────────────────────
+# ââ Batch result helper ââââââââââââââââââââââââââââââââââââââ
 async def _batch_result(msg, chat_id, status, bet_ids):
     """Resolve multiple bets at once."""
     con = db()
     now = datetime.now(timezone.utc).isoformat()
-    icons = {"won": "✅", "lost": "❌", "void": "↩️"}
+    icons = {"won": "â", "lost": "â", "void": "â©ï¸"}
     icon = icons.get(status, "?")
     status_label = {"won": "GAGNE", "lost": "PERDU", "void": "ANNULE"}
 
@@ -1114,12 +1168,12 @@ async def _batch_result(msg, chat_id, status, bet_ids):
 
     lines = [f"{len(resolved)} paris resolus : {status_label.get(status, status.upper())}\n"]
     for bid, desc, odds, pnl_text, _, tag in resolved:
-        lines.append(f"{icon} #{bid} {desc} @ {odds:.2f} → {pnl_text}{tag}")
+        lines.append(f"{icon} #{bid} {desc} @ {odds:.2f} â {pnl_text}{tag}")
 
     if skipped:
         lines.append("")
         for bid, reason in skipped:
-            lines.append(f"⚠️ #{bid} : {reason}")
+            lines.append(f"â ï¸ #{bid} : {reason}")
 
     if is_duo(chat_id):
         tc = get_duo_tricount(con, chat_id)
@@ -1146,7 +1200,7 @@ async def _batch_result(msg, chat_id, status, bet_ids):
         await sync_sheets({"action": "update_bet", "id": bid, "status": status, "sheet_tab": sheet_tab})
 
 
-# ── /win /loss /void — Résultat d'un pari ───────────────────
+# ââ /win /loss /void â RÃ©sultat d'un pari âââââââââââââââââââ
 async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     chat_id = msg.chat_id
@@ -1159,10 +1213,10 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not status:
         return
 
-    # ── Batch mode: /win 14 to 19 or /win 14-19 ──
+    # ââ Batch mode: /win 14 to 19 or /win 14-19 ââ
     if ctx.args:
         batch_ids = None
-        if len(ctx.args) >= 3 and ctx.args[1].lower() in ('to', 'a', 'à'):
+        if len(ctx.args) >= 3 and ctx.args[1].lower() in ('to', 'a', 'Ã '):
             try:
                 start_id = int(ctx.args[0])
                 end_id = int(ctx.args[2])
@@ -1219,9 +1273,9 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bet = pending[0]
         elif len(pending) > 1:
             con.close()
-            lines = ["Plusieurs paris en attente — precise lequel :\n"]
+            lines = ["Plusieurs paris en attente â precise lequel :\n"]
             for p in pending:
-                lines.append(f"  /win {p['id']}  →  {p['description']} @ {p['odds']:.2f}")
+                lines.append(f"  /win {p['id']}  â  {p['description']} @ {p['odds']:.2f}")
             await msg.reply_text("\n".join(lines))
             return
 
@@ -1355,7 +1409,7 @@ async def cmd_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
-# ── /solde ──────────────────────────────────────────────────
+# ââ /solde ââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1451,7 +1505,7 @@ async def cmd_solde(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
 
 
-# ── /soldeloro — P&L des paris Loro (CHF) ──────────────────
+# ââ /soldeloro â P&L des paris Loro (CHF) ââââââââââââââââââ
 async def cmd_solde_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1524,9 +1578,9 @@ async def cmd_solde_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"P&L duo : {total_pnl_duo:+.0f} CHF ({pnl_pp:+.0f}/pers.)"
     )
     if pnl_pp >= 0:
-        text += f"\n  → Kekko doit {pnl_pp:.0f} CHF a Rapha"
+        text += f"\n  â Kekko doit {pnl_pp:.0f} CHF a Rapha"
     else:
-        text += f"\n  → Rapha doit {-pnl_pp:.0f} CHF a Kekko"
+        text += f"\n  â Rapha doit {-pnl_pp:.0f} CHF a Kekko"
     text += f"\nROI : {roi:+.1f}%"
     if total_pnl_rago != 0:
         text += f"\n\nRago (sur compte Kekko) : {total_pnl_rago:+.0f} CHF"
@@ -1536,7 +1590,52 @@ async def cmd_solde_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ── /depotLoro /retraitLoro ────────────────────────────────
+
+# ── /soldecharly — P&L des paris Charly (USD) ──────────────────
+async def cmd_solde_charly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_duo(update.effective_chat.id):
+        await update.message.reply_text("Commande disponible uniquement dans le chat duo.")
+        return
+    con = db()
+    rows = con.execute(
+        "SELECT user_name, stake, odds, status, annexe_name, annexe_stake FROM bets WHERE chat_id = ? AND is_charly = 1",
+        (update.effective_chat.id,)
+    ).fetchall()
+    con.close()
+    if not rows:
+        await update.message.reply_text("Aucun pari Charly enregistre.")
+        return
+    total_won = 0
+    total_lost = 0
+    pending_count = 0
+    pending_stakes = 0
+    for r in rows:
+        stake_val = r[1]
+        odds_val = r[2]
+        status = r[3]
+        annexe_n = r[4]
+        annexe_s = r[5] or 0
+        duo_stake = stake_val - annexe_s
+        if status == "won":
+            total_won += duo_stake * (odds_val - 1)
+        elif status == "lost":
+            total_lost += duo_stake
+        elif status == "pending":
+            pending_count += 1
+            pending_stakes += stake_val
+    net = total_won - total_lost
+    pp = net / 2
+    text = (
+        f"SOLDE CHARLY (USD)\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"Gains : +{total_won:.0f} USD\n"
+        f"Pertes : -{total_lost:.0f} USD\n"
+        f"Net : {'+' if net >= 0 else ''}{net:.0f} USD ({'+' if pp >= 0 else ''}{pp:.0f}/pers.)\n\n"
+        f"En cours : {pending_count} paris ({pending_stakes:.0f} USD)"
+    )
+    await update.message.reply_text(text)
+
+# ââ /depotLoro /retraitLoro ââââââââââââââââââââââââââââââââ
 async def cmd_depot_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     parts = update.message.text.strip().split(maxsplit=2)
@@ -1597,7 +1696,7 @@ async def cmd_retrait_loro(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Retrait Loro : -{amount:.0f} CHF ({desc})\nCapital depose total : {total:.0f} CHF")
 
 
-# ── /historique ─────────────────────────────────────────────
+# ââ /historique âââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1612,7 +1711,7 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Aucun pari enregistre.")
         return
 
-    icons = {"pending": "⏳", "won": "✅", "lost": "❌", "void": "↩️"}
+    icons = {"pending": "â³", "won": "â", "lost": "â", "void": "â©ï¸"}
     duo = is_duo(chat_id)
     c = cur(chat_id)
     lines = ["HISTORIQUE (15 derniers)\n"]
@@ -1639,7 +1738,7 @@ async def cmd_historique(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /stats ──────────────────────────────────────────────────
+# ââ /stats ââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1707,7 +1806,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ── /dettes ─────────────────────────────────────────────────
+# ââ /dettes âââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1758,20 +1857,20 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if tx_list:
             lines.append("\n--- Transferts ---")
             for tx in tx_list[:5]:
-                lines.append(f"  {tx['from_name']}→{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
+                lines.append(f"  {tx['from_name']}â{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
 
         # Settlement
         bal = tc["balance"]
         a, b = tc["a"], tc["b"]
         if bal > 0.5:
-            lines.append(f"\nReglement : {b} → {a} : {bal:.0f} {c}")
+            lines.append(f"\nReglement : {b} â {a} : {bal:.0f} {c}")
         elif bal < -0.5:
-            lines.append(f"\nReglement : {a} → {b} : {abs(bal):.0f} {c}")
+            lines.append(f"\nReglement : {a} â {b} : {abs(bal):.0f} {c}")
 
         await update.message.reply_text("\n".join(lines))
         return
 
-    # ── Group tricount mode ──
+    # ââ Group tricount mode ââ
     balances = get_group_tricount(con, chat_id)
 
     # Get extra info for display
@@ -1840,7 +1939,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tx_list:
         lines.append("\n--- Transferts ---")
         for tx in tx_list[:5]:
-            lines.append(f"  {tx['from_name']}→{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
+            lines.append(f"  {tx['from_name']}â{tx['to_name']} {tx['amount']:.0f} {c} ({tx['description']})")
 
     # Settlement suggestions
     debtors = sorted([(n, -bal) for n, bal in balances.items() if bal < -0.5], key=lambda x: -x[1])
@@ -1852,7 +1951,7 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cr = list(creditors)
         while di < len(d) and ci < len(cr):
             transfer = min(d[di][1], cr[ci][1])
-            lines.append(f"  {d[di][0]} → {cr[ci][0]} : {transfer:.0f} {c}")
+            lines.append(f"  {d[di][0]} â {cr[ci][0]} : {transfer:.0f} {c}")
             d[di] = (d[di][0], d[di][1] - transfer)
             cr[ci] = (cr[ci][0], cr[ci][1] - transfer)
             if d[di][1] < 0.5: di += 1
@@ -1867,17 +1966,17 @@ async def cmd_dettes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             a_n = r["annexe_name"] or "?"
             bettor = r["user_name"]
             if r["status"] == "pending":
-                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (pending) — avance par {bettor}")
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (pending) â avance par {bettor}")
             elif r["status"] == "lost":
-                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (perdu) — {ANNEXE_HANDLER} doit {a_s:.0f} a {bettor}")
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (perdu) â {ANNEXE_HANDLER} doit {a_s:.0f} a {bettor}")
             elif r["status"] == "won":
                 profit = a_s * (r["odds"] - 1)
-                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (gagne) — {bettor} doit {profit:.0f} a {ANNEXE_HANDLER}")
+                lines.append(f"  #{r['id']} {a_n} {a_s:.0f} {c} (gagne) â {bettor} doit {profit:.0f} a {ANNEXE_HANDLER}")
 
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /pending ────────────────────────────────────────────────
+# ââ /pending ââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     con = db()
@@ -1915,16 +2014,16 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for r in waiting:
             par = f" [{r['user_name']}]" if duo else ""
             lines.append(
-                f"⏸ #{r['id']}{par} | {r['description']} @ {r['odds']:.2f} | "
-                f"mise: ? → /confirm {r['id']} <mise>"
+                f"â¸ #{r['id']}{par} | {r['description']} @ {r['odds']:.2f} | "
+                f"mise: ? â /confirm {r['id']} <mise>"
             )
 
-    lines.append(f"\n→ /win <id> ou /loss <id> pour marquer le resultat")
-    lines.append(f"→ /win <id> to <id> pour resulter en batch")
+    lines.append(f"\nâ /win <id> ou /loss <id> pour marquer le resultat")
+    lines.append(f"â /win <id> to <id> pour resulter en batch")
     await update.message.reply_text("\n".join(lines))
 
 
-# ── /delete ─────────────────────────────────────────────────
+# ââ /delete âââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not ctx.args:
@@ -1972,7 +2071,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "delete_bet", "id": bet_id, "sheet_tab": sheet_tab})
 
 
-# ── /date — Override event date ────────────────────────────────
+# ââ /date â Override event date ââââââââââââââââââââââââââââââââ
 async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or len(ctx.args) < 2:
         await update.message.reply_text("Format : /date #ID JJ/MM ou AAAA-MM-JJ\nEx: /date #42 05/09")
@@ -2031,13 +2130,13 @@ async def cmd_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     con.close()
 
     dp = event_date.split('-')
-    await update.message.reply_text(f"Pari #{bet_id} : date evenement → {dp[2]}/{dp[1]}/{dp[0]}")
+    await update.message.reply_text(f"Pari #{bet_id} : date evenement â {dp[2]}/{dp[1]}/{dp[0]}")
 
     sheet_tab = "Kekko-Rapha" if is_duo(chat_id) else "Paris"
     await sync_sheets({"action": "update_date", "id": bet_id, "event_date": event_date, "sheet_tab": sheet_tab})
 
 
-# ── /help ───────────────────────────────────────────────────
+# ââ /help âââââââââââââââââââââââââââââââââââââââââââââââââââ
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     duo = is_duo(chat_id)
@@ -2048,31 +2147,34 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "BET TRACKER (mode duo)\n\n"
             "Enregistrer un pari :\n"
             f"  /lock 800 Strasbourg 1N2 3,10\n"
-            f"  /lock 500 Basel ML 2,10 @loro — pari Loro (CHF)\n"
-            f"  /lock 500 Basel ML 2,10 -Rago 100 @loro — Loro + annexe\n"
-            f"  /wait PSG ML 1,80 — pre-enregistre sans mise\n"
-            f"  /confirm 327 3000 — confirme la mise\n"
-            f"  → enregistre 800 {c} par toi pour l'autre\n\n"
+            f"  /lock 500 Basel ML 2,10 @loro â pari Loro (CHF)\n"
+            f"  /lock 500 Basel ML 2,10 -Rago 100 @loro â Loro + annexe\n"
+            f"  /lock 200 Nets ML 2,10 @charly   pari Charly (USD)\n"
+            f"  /lock 200 Nets ML 2,10 -Rago 50 @charly   Charly + annexe\n"
+            f"  /wait PSG ML 1,80 â pre-enregistre sans mise\n"
+            f"  /confirm 327 3000 â confirme la mise\n"
+            f"  â enregistre 800 {c} par toi pour l'autre\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
             "  /loss (repondre au pari ou /loss <id>)\n"
-            "  /win 14 to 19 — resulter en batch\n\n"
+            "  /win 14 to 19 â resulter en batch\n\n"
             "Transactions :\n"
-            "  /depense 80 restaurant — frais partage (tu as paye)\n"
-            "  /depense Rapha 50 uber — frais partage (Rapha a paye)\n"
-            "  /remb Rapha 200 a Kekko — transfert direct\n\n"
+            "  /depense 80 restaurant â frais partage (tu as paye)\n"
+            "  /depense Rapha 50 uber â frais partage (Rapha a paye)\n"
+            "  /remb Rapha 200 a Kekko â transfert direct\n\n"
             "Stats :\n"
-            "  /solde — balance Tricount entre vous deux\n"
-            "  /dettes — detail qui doit quoi\n"
-            "  /pending — paris en attente\n"
-            "  /historique — 15 derniers paris\n"
-            "  /stats — stats detaillees\n"
-            "  /soldeloro — solde + capital Loro (CHF)\n"
-            "  /depotloro 2000 — ajouter capital au kiosque\n"
-            "  /retraitloro 500 — retirer capital du kiosque\n"
-            "  /date #ID JJ/MM — changer la date evenement\n"
-            "  /delete <id> — supprimer un pari\n"
-            "  /deletetx <id> — supprimer un remb/depense"
+            "  /solde â balance Tricount entre vous deux\n"
+            "  /dettes â detail qui doit quoi\n"
+            "  /pending â paris en attente\n"
+            "  /historique â 15 derniers paris\n"
+            "  /stats â stats detaillees\n"
+            "  /soldeloro â solde + capital Loro (CHF)\n"
+            f"  /soldecharly   solde + capital Charly (USD)\n"
+            "  /depotloro 2000 â ajouter capital au kiosque\n"
+            "  /retraitloro 500 â retirer capital du kiosque\n"
+            "  /date #ID JJ/MM â changer la date evenement\n"
+            "  /delete <id> â supprimer un pari\n"
+            "  /deletetx <id> â supprimer un remb/depense"
         )
     else:
         text = (
@@ -2081,37 +2183,37 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  /lock 800 Strasbourg 1N2 3,10\n"
             "  /lock 500 Le Mans ML 1.70\n"
             "  /lock 7000 Real ML 1,50 -Julien 1000\n"
-            "     → annexe : 1000 pour Julien, 6000 trio\n"
-            "  /wait PSG ML 1,80 — pre-enregistre sans mise\n"
-            "  /confirm 327 3000 — confirme la mise\n\n"
+            "     â annexe : 1000 pour Julien, 6000 trio\n"
+            "  /wait PSG ML 1,80 â pre-enregistre sans mise\n"
+            "  /confirm 327 3000 â confirme la mise\n\n"
             "Resultat :\n"
             "  /win  (repondre au pari ou /win <id>)\n"
             "  /loss (repondre au pari ou /loss <id>)\n"
-            "  /win 14 to 19 — resulter en batch\n"
+            "  /win 14 to 19 â resulter en batch\n"
             "  /void (annule/rembourse)\n\n"
             "Transactions :\n"
-            "  /remb Marco 100 a Kekko — transfert direct\n"
-            "  /depense 935 bet365 depot @Kekko — avance partagee\n"
-            "  /retrait 6000 bet365 @Kekko — retrait partage\n\n"
+            "  /remb Marco 100 a Kekko â transfert direct\n"
+            "  /depense 935 bet365 depot @Kekko â avance partagee\n"
+            "  /retrait 6000 bet365 @Kekko â retrait partage\n\n"
             "Stats :\n"
-            "  /solde — P&L du groupe\n"
-            "  /dettes — qui doit quoi a qui\n"
-            "  /pending — paris en attente\n"
-            "  /historique — 15 derniers paris\n"
-            "  /stats — stats detaillees\n"
-            "  /date #ID JJ/MM — changer la date evenement\n"
-            "  /delete <id> — supprimer un pari\n"
-            "  /deletetx <id> — supprimer un remb/depense"
+            "  /solde â P&L du groupe\n"
+            "  /dettes â qui doit quoi a qui\n"
+            "  /pending â paris en attente\n"
+            "  /historique â 15 derniers paris\n"
+            "  /stats â stats detaillees\n"
+            "  /date #ID JJ/MM â changer la date evenement\n"
+            "  /delete <id> â supprimer un pari\n"
+            "  /deletetx <id> â supprimer un remb/depense"
         )
     await update.message.reply_text(text)
 
 
-# ── /remb — Transaction hors-paris ────────────────────────────
+# ââ /remb â Transaction hors-paris ââââââââââââââââââââââââââââ
 REMB_PATTERN = re.compile(
     r"(\w+)\s+"              # from
     r"(\d+(?:[.,]\d+)?)"     # amount
-    r"\s*(?:€|eur|chf)?"     # optional currency
-    r"\s*(?:à|a)\s+"         # "à" or "a"
+    r"\s*(?:â¬|eur|chf)?"     # optional currency
+    r"\s*(?:Ã |a)\s+"         # "Ã " or "a"
     r"(\w+)"                 # to
     r"(?:\s+(.+))?",         # optional description
     re.IGNORECASE
@@ -2120,15 +2222,15 @@ REMB_PATTERN = re.compile(
 async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text(
-            "Format : /remb <de> <montant> à <vers> [description]\n"
-            "Ex: /remb Rapha 200 à Kekko remboursement"
+            "Format : /remb <de> <montant> Ã  <vers> [description]\n"
+            "Ex: /remb Rapha 200 Ã  Kekko remboursement"
         )
         return
 
     raw = " ".join(ctx.args)
     m = REMB_PATTERN.search(raw)
     if not m:
-        await update.message.reply_text("Format pas reconnu.\nEx: /remb Rapha 200 à Kekko remboursement")
+        await update.message.reply_text("Format pas reconnu.\nEx: /remb Rapha 200 Ã  Kekko remboursement")
         return
 
     from_name = m.group(1).capitalize()
@@ -2175,7 +2277,7 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"Transaction #{tx_id} enregistree\n"
-        f"   {from_name} → {to_name} : {amount:.0f} {c}\n"
+        f"   {from_name} â {to_name} : {amount:.0f} {c}\n"
         f"   Motif : {description}"
     )
     if debt_text:
@@ -2195,7 +2297,7 @@ async def cmd_remb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     })
 
 
-# ── /deletetx — Supprimer une transaction ou depense ────────
+# ââ /deletetx â Supprimer une transaction ou depense ââââââââ
 async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not ctx.args:
@@ -2256,7 +2358,7 @@ async def cmd_deletetx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Transaction/depense #{tx_id} introuvable.")
 
 
-# ── /depense — Frais partagé (Tricount) ─────────────────────
+# ââ /depense â Frais partagÃ© (Tricount) âââââââââââââââââââââ
 async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     duo = is_duo(chat_id)
@@ -2305,7 +2407,7 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # In duo mode, only DUO_PARTICIPANTS can be attributed without @mention
     if duo and paid_by not in DUO_PARTICIPANTS:
         await update.message.reply_text(
-            f"Nom inconnu « {paid_by} ». Utilise @Kekko ou @Rapha pour attribuer la depense."
+            f"Nom inconnu Â« {paid_by} Â». Utilise @Kekko ou @Rapha pour attribuer la depense."
         )
         return
 
@@ -2350,7 +2452,7 @@ async def cmd_depense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     })
 
 
-# ── /retrait — Retrait partagé (inverse de depense) ──────────
+# ââ /retrait â Retrait partagÃ© (inverse de depense) ââââââââââ
 async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     duo = is_duo(chat_id)
@@ -2387,7 +2489,7 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # In duo mode, only DUO_PARTICIPANTS can be attributed without @mention
     if duo and received_by not in DUO_PARTICIPANTS:
         await update.message.reply_text(
-            f"Nom inconnu « {received_by} ». Utilise @Kekko ou @Rapha pour attribuer le retrait."
+            f"Nom inconnu Â« {received_by} Â». Utilise @Kekko ou @Rapha pour attribuer le retrait."
         )
         return
 
@@ -2444,7 +2546,7 @@ async def cmd_retrait(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     })
 
 
-# ── Fallback : reply gagné/perdu ────────────────────────────
+# ââ Fallback : reply gagnÃ©/perdu ââââââââââââââââââââââââââââ
 async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.reply_to_message or not msg.text:
@@ -2452,9 +2554,9 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id = msg.chat_id
     text_lower = msg.text.strip().lower()
-    won_words = {"gagné", "gagne", "win", "won", "w", "gg"}
+    won_words = {"gagnÃ©", "gagne", "win", "won", "w", "gg"}
     lost_words = {"perdu", "perd", "lose", "lost", "l"}
-    void_words = {"annulé", "annule", "void", "push", "nul"}
+    void_words = {"annulÃ©", "annule", "void", "push", "nul"}
 
     status = None
     if text_lower in won_words:
@@ -2606,7 +2708,7 @@ async def on_reply_result(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sync_sheets({"action": "update_bet", "id": bet["id"], "status": status, "sheet_tab": sheet_tab})
 
 
-# ── /sync — Pousser la DB vers Google Sheets ────────────────
+# ââ /sync â Pousser la DB vers Google Sheets ââââââââââââââââ
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not SHEETS_WEBHOOK_URL:
@@ -2715,7 +2817,7 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg_text)
 
 
-# ── /restore — Re-importer les paris depuis Google Sheets ───
+# ââ /restore â Re-importer les paris depuis Google Sheets âââ
 async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not SHEETS_WEBHOOK_URL:
@@ -2802,7 +2904,7 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Main ────────────────────────────────────────────────────
+# ââ Main ââââââââââââââââââââââââââââââââââââââââââââââââââââ
 def main():
     if not BOT_TOKEN:
         print("ERROR: Set BOT_TOKEN environment variable")
@@ -2819,6 +2921,7 @@ def main():
 
     app.add_handler(CommandHandler("solde", cmd_solde))
     app.add_handler(CommandHandler("soldeloro", cmd_solde_loro))
+    app.add_handler(CommandHandler("soldecharly", cmd_solde_charly))
     app.add_handler(CommandHandler("depotloro", cmd_depot_loro))
     app.add_handler(CommandHandler("retraitloro", cmd_retrait_loro))
     app.add_handler(CommandHandler("historique", cmd_historique))
@@ -2857,6 +2960,7 @@ def main():
             ("confirm", "Confirmer la mise d'un /wait"),
             ("solde", "Voir le solde P&L"),
             ("soldeloro", "P&L paris Loro (CHF)"),
+            ("soldecharly", "P&L paris Charly (USD)"),
             ("dettes", "Voir qui doit quoi"),
             ("pending", "Paris en cours"),
             ("historique", "Derniers paris resolus"),
